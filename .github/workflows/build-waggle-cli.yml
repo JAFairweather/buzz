@@ -1,0 +1,31 @@
+name: Build Waggle CLI hotfix
+
+on:
+  push:
+    branches: [build/linux-cli-15bbd9e]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Build and test the exact CLI source
+        run: |
+          cargo test -p buzz-cli normalized_events_preserve_the_canonical_signature
+          cargo build --release -p buzz-cli
+          sha256sum target/release/buzz > target/release/buzz.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: buzz-cli-linux-x86_64-15bbd9e
+          path: |
+            target/release/buzz
+            target/release/buzz.sha256
+          if-no-files-found: error
+          retention-days: 3
