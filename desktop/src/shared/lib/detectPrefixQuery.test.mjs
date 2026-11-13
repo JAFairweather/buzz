@@ -58,6 +58,34 @@ test("7796a4f4: ( before @ triggers mention query", () => {
   });
 });
 
+test("waggle#720: markdown formatting and table pipes before @ trigger mention query", () => {
+  assert.deepEqual(at("@", "**@alice", PEOPLE), {
+    query: "alice",
+    startIndex: 2,
+  });
+  assert.deepEqual(at("@", "| **@alice", PEOPLE), {
+    query: "alice",
+    startIndex: 4,
+  });
+  assert.deepEqual(at("@", "|@alice", PEOPLE), {
+    query: "alice",
+    startIndex: 1,
+  });
+  assert.deepEqual(at("@", "_@alice", PEOPLE), {
+    query: "alice",
+    startIndex: 1,
+  });
+  assert.deepEqual(at("@", "~~@alice", PEOPLE), {
+    query: "alice",
+    startIndex: 2,
+  });
+  assert.deepEqual(at("@", "**@bob jo", PEOPLE), {
+    query: "bob jo",
+    startIndex: 2,
+  });
+  assert.equal(at("@", "foo_@alice", PEOPLE), null);
+});
+
 test("bracket mid-sentence (word before the bracket) still triggers", () => {
   // The char immediately before the prefix is `(`, which is the boundary —
   // what precedes the bracket is irrelevant.

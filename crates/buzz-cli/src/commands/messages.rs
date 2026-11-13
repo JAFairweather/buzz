@@ -528,10 +528,11 @@ pub async fn cmd_send_message(
 
     // Resolve @name mentions in the author-written body only — not the media markdown we
     // append above, which is derived from upload metadata and can't carry `@names`.
-    let mut auto_resolved = resolve_content_mentions(client, &p.channel_id, &p.content).await;
+    // Strip code regions first so inline/fenced code spans do not trigger notifications.
+    let stripped = strip_code_regions(&p.content);
+    let mut auto_resolved = resolve_content_mentions(client, &p.channel_id, &stripped).await;
 
     // NIP-27: also extract nostr:npub1… inline references (skipping code regions)
-    let stripped = strip_code_regions(&p.content);
     let uri_pubkeys = extract_nostr_uris(&stripped);
     merge_mentions(&mut auto_resolved, &uri_pubkeys, MENTION_CAP);
 
@@ -1054,6 +1055,10 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(resolved, vec![PK_VALID_A, PK_VALID_B]);
+
+        let formatted_names =
+            extract_at_mentions_with_known("| **@Will Pfleger** | _@Alice_ |", &known_refs);
+        assert_eq!(formatted_names, vec!["will pfleger", "alice"]);
     }
 
     #[test]

@@ -69,6 +69,26 @@ test("matches @Name at the end of spoiler content", () => {
   assert.equal(hasMention("||hi @Alice||", "Alice"), true);
 });
 
+test("matches @Name inside markdown table cells and bold table cells (#720)", () => {
+  assert.equal(hasMention("| **@Kerouac** |", "Kerouac"), true);
+  assert.equal(hasMention("|**@Kerouac**|", "Kerouac"), true);
+  assert.equal(hasMention("|@Kerouac|", "Kerouac"), true);
+  assert.equal(hasMention("| @Kerouac|", "Kerouac"), true);
+  assert.equal(hasMention("| **@My Dude** |", "My Dude"), true);
+});
+
+test("matches @Name inside strikethrough, brackets, and quotes", () => {
+  assert.equal(hasMention("~~@Alice~~", "Alice"), true);
+  assert.equal(hasMention("[@Alice]", "Alice"), true);
+  assert.equal(hasMention('"@Alice"', "Alice"), true);
+  assert.equal(hasMention("'@Alice'", "Alice"), true);
+  assert.equal(hasMention(">@Alice", "Alice"), true);
+});
+
+test("does not match @Name glued after word underscore", () => {
+  assert.equal(hasMention("foo_@Alice", "Alice"), false);
+});
+
 // ── Boundary conditions ───────────────────────────────────────────────
 
 test("matches @Name followed by punctuation", () => {
