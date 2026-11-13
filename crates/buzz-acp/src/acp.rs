@@ -139,6 +139,8 @@ fn build_initialize_params() -> serde_json::Value {
 pub struct AcpClient {
     /// The agent child process (kept alive to prevent zombie).
     child: Child,
+    /// Set from the initialize response: the agent accepts `session/close`.
+    session_close_supported: bool,
     /// Write end of the agent's stdin pipe.
     stdin: ChildStdin,
     /// Framed reader over the agent's stdout pipe (line-oriented, bounded).
@@ -479,6 +481,7 @@ impl AcpClient {
 
         Ok(Self {
             child,
+            session_close_supported: false,
             stdin,
             reader: FramedRead::new(stdout, LinesCodec::new_with_max_length(MAX_LINE_SIZE)),
             next_id: 0,
@@ -538,7 +541,23 @@ impl AcpClient {
         let params = build_initialize_params();
         let result = self.send_request("initialize", params).await?;
         tracing::debug!(target: "acp::init", "initialize response: {result}");
+        self.session_close_supported = advertises_session_close(&result);
         Ok(result)
+    }
+
+    /// Whether the agent advertised `sessionCapabilities.close` at initialize.
+    pub fn supports_session_close(&self) -> bool {
+        self.session_close_supported
+    }
+
+    /// Send `session/close`: the agent ends the session and frees what it
+    /// holds for it, including the session's MCP server processes.
+    pub async fn session_close(&mut self, session_id: &str) -> Result<serde_json::Value, AcpError> {
+        self.send_request(
+            "session/close",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
     }
 
     /// Send the ACP `authenticate` request for an adapter-advertised method.
@@ -1816,6 +1835,14 @@ fn permission_response_cancelled(id: &serde_json::Value) -> serde_json::Value {
         "id": id,
         "result": { "outcome": { "outcome": "cancelled" } }
     })
+}
+
+/// Whether an initialize result advertises `agentCapabilities.sessionCapabilities.close`
+/// (ACP: an object when supported, absent or null otherwise).
+pub(crate) fn advertises_session_close(init_result: &serde_json::Value) -> bool {
+    init_result
+        .pointer("/agentCapabilities/sessionCapabilities/close")
+        .is_some_and(|v| v.is_object())
 }
 
 /// Full `session/new` response — session ID plus the raw JSON result.
