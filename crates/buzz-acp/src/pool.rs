@@ -110,8 +110,23 @@ pub struct SessionState {
     /// a session's MCP servers running until it is closed (codex app-server
     /// holds one `buzz-dev-mcp` and one memory helper per session), so a
     /// session dropped without a close leaks those processes for the life of
-    /// the agent process.
-    pub retired: Vec<String>,
+    /// the agent process. A close that fails stays here, with its failure
+    /// count, and is retried on the next turn.
+    pub retired: Vec<RetiredSession>,
+}
+
+/// A session dropped from the cache and not yet confirmed closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredSession {
+    pub id: String,
+    /// `session/close` attempts that failed or timed out so far.
+    pub failures: u32,
+}
+
+impl RetiredSession {
+    pub fn new(id: String) -> Self {
+        Self { id, failures: 0 }
+    }
 }
 
 impl SessionState {
@@ -123,7 +138,7 @@ impl SessionState {
             }
             PromptSource::Heartbeat => {
                 if let Some(sid) = self.heartbeat_session.take() {
-                    self.retired.push(sid);
+                    self.retired.push(RetiredSession::new(sid));
                 }
                 self.heartbeat_turn_count = 0;
             }
@@ -138,7 +153,7 @@ impl SessionState {
         self.canvas_sections.remove(channel_id);
         match self.sessions.remove(channel_id) {
             Some(sid) => {
-                self.retired.push(sid);
+                self.retired.push(RetiredSession::new(sid));
                 true
             }
             None => false,
@@ -147,24 +162,33 @@ impl SessionState {
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
     pub fn invalidate_all(&mut self) {
+        self.retired.extend(
+            self.sessions
+                .drain()
+                .map(|(_, sid)| RetiredSession::new(sid)),
+        );
         self.retired
-            .extend(self.sessions.drain().map(|(_, sid)| sid));
-        self.retired.extend(self.heartbeat_session.take());
+            .extend(self.heartbeat_session.take().map(RetiredSession::new));
         self.turn_counts.clear();
         self.heartbeat_turn_count = 0;
         self.core_sections.clear();
         self.canvas_sections.clear();
     }
 
-    /// Take the retired session ids that are safe to close: any id that is
-    /// live in the cache again is kept open and dropped from the list.
-    pub fn take_retired(&mut self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for sid in std::mem::take(&mut self.retired) {
-            let live = self.heartbeat_session.as_deref() == Some(sid.as_str())
-                || self.sessions.values().any(|s| *s == sid);
-            if !live && !out.contains(&sid) {
-                out.push(sid);
+    /// Take the retired sessions that are safe to close: any id that is live
+    /// in the cache again is kept open and dropped from the list, and a
+    /// duplicate id keeps its highest failure count.
+    pub fn take_retired(&mut self) -> Vec<RetiredSession> {
+        let mut out: Vec<RetiredSession> = Vec::new();
+        for r in std::mem::take(&mut self.retired) {
+            let live = self.heartbeat_session.as_deref() == Some(r.id.as_str())
+                || self.sessions.values().any(|s| *s == r.id);
+            if live {
+                continue;
+            }
+            match out.iter_mut().find(|o| o.id == r.id) {
+                Some(o) => o.failures = o.failures.max(r.failures),
+                None => out.push(r),
             }
         }
         out
@@ -782,37 +806,81 @@ const PERMISSION_MODE_TIMEOUT: Duration = Duration::from_secs(5);
 /// the 60s generic RPC timeout.
 const SESSION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Failed `session/close` attempts on one session (one per turn) before the
+/// worker is replaced instead. Replacement kills the agent's process group,
+/// which ends every helper it still holds.
+pub(crate) const MAX_CLOSE_ATTEMPTS: u32 = 3;
+
+/// What [`close_retired_sessions`] could confirm.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RetiredClose {
+    /// Every retired session was closed, or the agent cannot close sessions.
+    Done,
+    /// Some closes failed; they stay retired and are retried next turn.
+    Retrying,
+    /// Cleanup cannot be confirmed (the agent exited, or a session failed
+    /// [`MAX_CLOSE_ATTEMPTS`] closes): the worker must be replaced.
+    ReplaceWorker,
+}
+
 /// Close every session this agent dropped since its last turn. Called at the
 /// start of each turn, before any session lookup, so the agent is idle and no
-/// prompt is in flight. Best effort: a failed or timed-out close is logged
-/// and not retried; the id is never closed twice. Agents that do not
-/// advertise `sessionCapabilities.close` are skipped (the list is still
+/// prompt is in flight. A failed or timed-out close keeps the session retired
+/// with one more failure, to be retried next turn; at [`MAX_CLOSE_ATTEMPTS`]
+/// the caller replaces the worker. A live id is never closed. Agents that do
+/// not advertise `sessionCapabilities.close` are skipped (the list is still
 /// cleared, so it cannot grow).
-pub(crate) async fn close_retired_sessions(agent: &mut OwnedAgent) -> usize {
+pub(crate) async fn close_retired_sessions(agent: &mut OwnedAgent) -> RetiredClose {
     let retired = agent.state.take_retired();
     if retired.is_empty() || !agent.acp.supports_session_close() {
-        return 0;
+        return RetiredClose::Done;
     }
-    let mut closed = 0;
-    for sid in retired {
-        match tokio::time::timeout(SESSION_CLOSE_TIMEOUT, agent.acp.session_close(&sid)).await {
-            Ok(Ok(_)) => {
-                closed += 1;
-                tracing::info!(target: "pool::session", agent = agent.index, "closed retired session {sid}");
-            }
-            Ok(Err(AcpError::AgentExited)) => {
-                tracing::warn!(target: "pool::session", agent = agent.index, "agent exited while closing retired session {sid}");
-                break;
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(target: "pool::session", agent = agent.index, "session/close {sid} failed: {e}");
-            }
-            Err(_) => {
-                tracing::warn!(target: "pool::session", agent = agent.index, "session/close {sid} timed out after {:?}", SESSION_CLOSE_TIMEOUT);
-            }
+    let mut outcome = RetiredClose::Done;
+    let mut pending = retired.into_iter();
+    while let Some(mut r) = pending.next() {
+        let failure =
+            match tokio::time::timeout(SESSION_CLOSE_TIMEOUT, agent.acp.session_close(&r.id)).await
+            {
+                Ok(Ok(_)) => {
+                    tracing::info!(
+                        target: "pool::session",
+                        agent = agent.index,
+                        "closed retired session {}",
+                        r.id
+                    );
+                    continue;
+                }
+                Ok(Err(AcpError::AgentExited)) => {
+                    tracing::warn!(
+                        target: "pool::session",
+                        agent = agent.index,
+                        "agent exited while closing retired session {}",
+                        r.id
+                    );
+                    // Keep the rest on record; the worker is replaced anyway.
+                    agent.state.retired.push(r);
+                    agent.state.retired.extend(pending);
+                    return RetiredClose::ReplaceWorker;
+                }
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => format!("timed out after {SESSION_CLOSE_TIMEOUT:?}"),
+            };
+        r.failures += 1;
+        tracing::warn!(
+            target: "pool::session",
+            agent = agent.index,
+            failures = r.failures,
+            "session/close {} failed: {failure}",
+            r.id
+        );
+        if r.failures >= MAX_CLOSE_ATTEMPTS {
+            outcome = RetiredClose::ReplaceWorker;
+        } else if outcome == RetiredClose::Done {
+            outcome = RetiredClose::Retrying;
         }
+        agent.state.retired.push(r);
     }
-    closed
+    outcome
 }
 
 async fn create_session_and_apply_model(
@@ -857,7 +925,7 @@ async fn create_session_and_apply_model(
     let session_id = resp.session_id.clone();
     let setup = finish_session_setup(agent, ctx, resp, is_goose, combined_system_prompt).await;
     if setup.is_err() {
-        agent.state.retired.push(session_id);
+        agent.state.retired.push(RetiredSession::new(session_id));
     }
     setup
 }
@@ -1499,7 +1567,30 @@ pub async fn run_prompt_task(
     // Close the sessions this agent dropped since its last turn (rotation,
     // cancel, failure, !rotate, model switch) before opening any new one, so
     // the agent's per-session helpers stay bounded by its live sessions.
-    close_retired_sessions(&mut agent).await;
+    //
+    // If cleanup cannot be confirmed, replace the worker: the pool respawns an
+    // AgentExited slot, which kills the old agent's process group and with it
+    // every helper it still holds. The batch is requeued as for any exit.
+    if close_retired_sessions(&mut agent).await == RetiredClose::ReplaceWorker {
+        tracing::warn!(
+            target: "pool::session",
+            agent = agent.index,
+            "retired sessions could not be closed — replacing the worker"
+        );
+        let requeue = match &source {
+            PromptSource::Channel(_) => requeue_batch_if_queue(&ctx, batch),
+            PromptSource::Heartbeat => None,
+        };
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::AgentExited,
+            requeue,
+        );
+        return;
+    }
 
     let (session_id, is_new_session) = match &source {
         PromptSource::Channel(cid) => {
@@ -5667,15 +5758,19 @@ mod tests {
     // set of helpers behind (buzz-agent@neil reached ~170 and hit the process
     // limit). These tests pin that every session leaving the cache is closed.
 
+    fn retired_ids(s: &SessionState) -> Vec<String> {
+        s.retired.iter().map(|r| r.id.clone()).collect()
+    }
+
     #[test]
     fn test_every_invalidation_retires_the_dropped_session() {
         let (mut s, ch_a, _ch_b) = make_state();
         s.invalidate(&PromptSource::Channel(ch_a));
-        assert_eq!(s.retired, vec!["sess-a".to_string()]);
+        assert_eq!(retired_ids(&s), vec!["sess-a"]);
         s.invalidate(&PromptSource::Heartbeat);
-        assert_eq!(s.retired, vec!["sess-a".to_string(), "sess-hb".to_string()]);
+        assert_eq!(retired_ids(&s), vec!["sess-a", "sess-hb"]);
         s.invalidate_all();
-        let mut got = s.take_retired();
+        let mut got: Vec<String> = s.take_retired().into_iter().map(|r| r.id).collect();
         got.sort();
         assert_eq!(got, vec!["sess-a", "sess-b", "sess-hb"]);
         assert!(s.retired.is_empty());
@@ -5692,15 +5787,24 @@ mod tests {
     }
 
     #[test]
-    fn test_take_retired_skips_live_and_duplicate_ids() {
+    fn test_take_retired_skips_live_ids_and_merges_duplicates() {
         let (mut s, ch_a, _ch_b) = make_state();
         s.retired = vec![
-            "sess-a".into(),
-            "old".into(),
-            "old".into(),
-            "sess-hb".into(),
+            RetiredSession::new("sess-a".into()),
+            RetiredSession {
+                id: "old".into(),
+                failures: 2,
+            },
+            RetiredSession::new("old".into()),
+            RetiredSession::new("sess-hb".into()),
         ];
-        assert_eq!(s.take_retired(), vec!["old".to_string()]);
+        assert_eq!(
+            s.take_retired(),
+            vec![RetiredSession {
+                id: "old".into(),
+                failures: 2
+            }]
+        );
         assert!(
             s.sessions.contains_key(&ch_a),
             "a live session is never closed"
@@ -5715,7 +5819,7 @@ mod tests {
             &PromptSource::Channel(ch_a),
             &ControlSignal::Rotate,
         );
-        assert_eq!(s.take_retired(), vec!["sess-a".to_string()]);
+        assert_eq!(retired_ids(&s), vec!["sess-a"]);
     }
 
     #[test]
@@ -5739,7 +5843,12 @@ mod tests {
     const FAKE_SESSION_AGENT: &str = r#"
 import json, subprocess, sys
 state, close_cap = sys.argv[1], sys.argv[2] == "1"
+fail_closes = int(sys.argv[3])  # closes to refuse first; -1 refuses every close
 helpers, n = {}, 0
+def reply(msg):
+    count()
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
 def count():
     live = sum(1 for p in helpers.values() if p.poll() is None)
     open(state, "w").write(str(live))
@@ -5758,15 +5867,30 @@ for line in sys.stdin:
         helpers[sid] = subprocess.Popen(["sleep", "600"])
         res = {"sessionId": sid}
     elif meth == "session/close":
+        if fail_closes != 0:
+            fail_closes -= 1 if fail_closes > 0 else 0
+            reply({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32603, "message": "close refused"}})
+            continue
         p = helpers.pop(params.get("sessionId"), None)
         if p:
             p.kill(); p.wait()
+    elif meth == "_goose/unstable/session/system-prompt/set":
+        reply({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32000, "message": "setup refused"}})
+        continue
     count()
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": res}) + "\n")
     sys.stdout.flush()
 "#;
 
     async fn fake_session_agent(close_cap: bool) -> (OwnedAgent, std::path::PathBuf) {
+        fake_session_agent_with(close_cap, 0, "fake").await
+    }
+
+    async fn fake_session_agent_with(
+        close_cap: bool,
+        fail_closes: i32,
+        name: &str,
+    ) -> (OwnedAgent, std::path::PathBuf) {
         let state = std::env::temp_dir().join(format!("buzz-acp-helpers-{}", Uuid::new_v4()));
         let mut acp = AcpClient::spawn(
             "python3",
@@ -5776,6 +5900,7 @@ for line in sys.stdin:
                 FAKE_SESSION_AGENT.into(),
                 state.display().to_string(),
                 if close_cap { "1" } else { "0" }.into(),
+                fail_closes.to_string(),
             ],
             &[],
             false,
@@ -5790,7 +5915,7 @@ for line in sys.stdin:
             model_capabilities: None,
             desired_model: None,
             model_overridden: false,
-            agent_name: "fake".into(),
+            agent_name: name.into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
         };
@@ -5883,6 +6008,127 @@ for line in sys.stdin:
             agent.state.retired.is_empty(),
             "the retired list is cleared even when close is unsupported"
         );
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_file(state);
+    }
+
+    async fn open_and_retire(agent: &mut OwnedAgent) -> String {
+        let sid = agent
+            .acp
+            .session_new_full("/tmp", vec![], None)
+            .await
+            .expect("session/new")
+            .session_id;
+        let ch = Uuid::new_v4();
+        agent.state.sessions.insert(ch, sid.clone());
+        agent.state.invalidate_channel(&ch);
+        sid
+    }
+
+    /// Murphy's PR 4 finding: a failed close must not drop the id. It stays
+    /// retired with its failure counted, and the next turn's close reaps it.
+    #[tokio::test]
+    async fn test_failed_close_is_retried_next_turn() {
+        let (mut agent, state) = fake_session_agent_with(true, 1, "fake").await;
+        let sid = open_and_retire(&mut agent).await;
+        assert_eq!(
+            close_retired_sessions(&mut agent).await,
+            RetiredClose::Retrying
+        );
+        assert_eq!(
+            agent.state.retired,
+            vec![RetiredSession {
+                id: sid,
+                failures: 1
+            }]
+        );
+        assert_eq!(live_helpers(&state), 1, "the refused close left its helper");
+        assert_eq!(close_retired_sessions(&mut agent).await, RetiredClose::Done);
+        assert!(agent.state.retired.is_empty());
+        assert_eq!(live_helpers(&state), 0, "the retry reaped it");
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_file(state);
+    }
+
+    /// A close that keeps failing ends in worker replacement, never in a
+    /// silently forgotten session.
+    #[tokio::test]
+    async fn test_persistent_close_failure_asks_for_worker_replacement() {
+        let (mut agent, state) = fake_session_agent_with(true, -1, "fake").await;
+        open_and_retire(&mut agent).await;
+        for attempt in 1..MAX_CLOSE_ATTEMPTS {
+            assert_eq!(
+                close_retired_sessions(&mut agent).await,
+                RetiredClose::Retrying,
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(
+            close_retired_sessions(&mut agent).await,
+            RetiredClose::ReplaceWorker
+        );
+        assert_eq!(agent.state.retired.len(), 1, "still on record, not dropped");
+        assert_eq!(agent.state.retired[0].failures, MAX_CLOSE_ATTEMPTS);
+        agent.acp.shutdown().await;
+        let _ = std::fs::remove_file(state);
+    }
+
+    /// The real `run_prompt_task` path: when cleanup is unconfirmed the turn
+    /// ends as AgentExited (so the pool respawns the slot and kills the old
+    /// process group) before any new session is opened.
+    #[tokio::test]
+    async fn test_run_prompt_task_replaces_worker_when_close_unconfirmed() {
+        let (mut agent, state) = fake_session_agent_with(true, -1, "fake").await;
+        let sid = open_and_retire(&mut agent).await;
+        agent.state.retired = vec![RetiredSession {
+            id: sid,
+            failures: MAX_CLOSE_ATTEMPTS - 1,
+        }];
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            None,
+            Some("heartbeat".into()),
+            Arc::new(make_prompt_context_no_owner()),
+            tx,
+            None,
+            "turn-close".into(),
+        )
+        .await;
+        let mut result = rx.recv().await.expect("prompt result");
+        assert!(
+            matches!(result.outcome, PromptOutcome::AgentExited),
+            "worker must be replaced"
+        );
+        assert!(
+            result.agent.state.heartbeat_session.is_none(),
+            "no new session was opened"
+        );
+        assert_eq!(
+            live_helpers(&state),
+            1,
+            "only the unclosable session's helper"
+        );
+        result.agent.acp.shutdown().await;
+        let _ = std::fs::remove_file(state);
+    }
+
+    /// A session whose setup fails after `session/new` is retired, and the
+    /// next turn's close reaps its helper.
+    #[tokio::test]
+    async fn test_post_create_setup_failure_retires_and_closes_session() {
+        let (mut agent, state) = fake_session_agent_with(true, 0, "goose").await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.system_prompt = Some("system".into());
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, None).await;
+        assert!(
+            err.is_err(),
+            "the fake refuses Goose's system-prompt request"
+        );
+        assert_eq!(retired_ids(&agent.state), vec!["s1"]);
+        assert_eq!(live_helpers(&state), 1);
+        assert_eq!(close_retired_sessions(&mut agent).await, RetiredClose::Done);
+        assert_eq!(live_helpers(&state), 0);
         agent.acp.shutdown().await;
         let _ = std::fs::remove_file(state);
     }
