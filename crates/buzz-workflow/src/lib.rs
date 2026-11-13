@@ -46,10 +46,11 @@ use std::sync::OnceLock;
 
 use buzz_core::kind::{event_kind_u32, is_workflow_execution_kind, KIND_REACTION};
 use buzz_core::tenant::CommunityId;
-use buzz_db::workflow::RunStatus;
+use buzz_db::workflow::{ApprovalStatus, CreateApprovalParams, RunStatus};
 use buzz_db::Db;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -188,30 +189,112 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 let step_count = result.step_index as i32;
 
-                if result.approval_token.is_some() {
-                    // Approval gates are not yet implemented (WF-08).
-                    // Fail explicitly rather than creating unreachable WaitingApproval rows.
-                    tracing::warn!(
-                        run_id = %run_id,
-                        step_index = result.step_index,
-                        "Workflow hit approval gate — not yet implemented, marking as failed"
-                    );
-                    if let Err(e) = self
-                        .db
-                        .update_workflow_run(
+                if let Some(pending) = result.pending_approval {
+                    let setup: Result<(), WorkflowError> = async {
+                        let run = self.db.get_workflow_run(community_id, run_id).await?;
+                        let workflow = self.db.get_workflow(community_id, run.workflow_id).await?;
+                        let def: WorkflowDef = serde_json::from_value(workflow.definition.clone())
+                            .map_err(|e| WorkflowError::InvalidDefinition(e.to_string()))?;
+                        let step = def.steps.get(result.step_index).ok_or_else(|| {
+                            WorkflowError::InvalidDefinition("approval step index is out of range".into())
+                        })?;
+                        if !matches!(&step.action, ActionDef::RequestApproval { .. }) {
+                            return Err(WorkflowError::InvalidDefinition(
+                                "suspended step is not an approval action".into(),
+                            ));
+                        }
+                        let approver = pending.from.trim();
+                        let exact_approver = approver.len() == 64
+                            && approver.chars().all(|c| c.is_ascii_hexdigit());
+                        if approver != "any" && !exact_approver {
+                            return Err(WorkflowError::InvalidDefinition(
+                                "approval from must be 'any' or an exact 64-character pubkey".into(),
+                            ));
+                        }
+                        if pending.message.trim().is_empty() {
+                            return Err(WorkflowError::InvalidDefinition(
+                                "approval message must not be empty".into(),
+                            ));
+                        }
+                        let timeout_secs = executor::parse_duration_secs(&pending.timeout)?;
+                        if timeout_secs == 0 || timeout_secs > 30 * 24 * 60 * 60 {
+                            return Err(WorkflowError::InvalidDefinition(
+                                "approval timeout must be between 1 second and 30 days".into(),
+                            ));
+                        }
+                        let timeout_secs = i64::try_from(timeout_secs).map_err(|_| {
+                            WorkflowError::InvalidDefinition("approval timeout is too large".into())
+                        })?;
+                        let expires_at = Utc::now()
+                            .checked_add_signed(chrono::Duration::seconds(timeout_secs))
+                            .ok_or_else(|| WorkflowError::InvalidDefinition(
+                                "approval timeout exceeds supported date range".into(),
+                            ))?;
+                        let channel = workflow.channel_id.ok_or_else(|| {
+                            WorkflowError::InvalidDefinition(
+                                "approval workflow must be bound to a channel".into(),
+                            )
+                        })?;
+                        self.db.create_approval(CreateApprovalParams {
+                            community_id,
+                            token: &pending.token,
+                            workflow_id: workflow.id,
+                            run_id,
+                            step_id: &step.id,
+                            step_index: step_count,
+                            approver_spec: approver,
+                            expires_at,
+                        }).await?;
+                        self.db.update_workflow_run(
                             community_id,
                             run_id,
-                            RunStatus::Failed,
+                            RunStatus::WaitingApproval,
                             step_count,
                             &trace_json,
-                            Some("approval gates not yet implemented — see WF-08"),
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            run_id = %run_id,
-                            "Failed to update run to Failed (approval gate): {e}"
+                            None,
+                        ).await?;
+                        let token_hash = hex::encode(Sha256::digest(pending.token.as_bytes()));
+                        let notice = format!(
+                            "Approval requested for workflow '{}' (run {}): {}\nApprove: buzz workflows approve --token {}\nDeny: buzz workflows approve --token {} --approved false",
+                            workflow.name, run_id, pending.message, token_hash, token_hash,
                         );
+                        self.action_sink()?
+                            .send_message(
+                                community_id,
+                                &channel.to_string(),
+                                &notice,
+                                &hex::encode(&workflow.owner_pubkey),
+                                exact_approver.then_some(approver),
+                            )
+                            .await?;
+                        Ok(())
+                    }.await;
+                    if let Err(e) = setup {
+                        tracing::error!(run_id = %run_id, "Failed to prepare approval gate: {e}");
+                        let _ = self
+                            .db
+                            .update_approval(
+                                community_id,
+                                &pending.token,
+                                ApprovalStatus::Expired,
+                                None,
+                                Some("approval setup failed"),
+                            )
+                            .await;
+                        if let Err(db_err) = self
+                            .db
+                            .update_workflow_run(
+                                community_id,
+                                run_id,
+                                RunStatus::Failed,
+                                step_count,
+                                &trace_json,
+                                Some(&e.to_string()),
+                            )
+                            .await
+                        {
+                            tracing::error!(run_id = %run_id, "Failed to mark approval run failed: {db_err}");
+                        }
                     }
                 } else {
                     tracing::info!(run_id = %run_id, "Workflow run completed");

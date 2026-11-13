@@ -892,10 +892,10 @@ pub enum WorkflowsCmd {
     },
     /// Approve or deny a workflow step
     #[command(
-        after_help = "Examples:\n  buzz workflows approve --token <UUID>\n  buzz workflows approve --token <UUID> --approved false --note \"needs revision\""
+        after_help = "Examples:\n  buzz workflows approve --token <UUID-or-hash>\n  buzz workflows approve --token <UUID-or-hash> --approved false --note \"needs revision\""
     )]
     Approve {
-        /// The approval token UUID (from the approval request)
+        /// Approval token UUID or 64-character request hash
         #[arg(long)]
         token: String,
         /// Approve (true) or deny (false) the step

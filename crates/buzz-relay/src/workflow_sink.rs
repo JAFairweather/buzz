@@ -176,10 +176,12 @@ impl ActionSink for RelayActionSink {
         channel_id: &str,
         text: &str,
         author_pubkey: &str,
+        recipient_pubkey: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
         let channel_id = channel_id.to_owned();
         let text = text.to_owned();
         let author_pubkey = author_pubkey.to_owned();
+        let recipient_pubkey = recipient_pubkey.map(str::to_owned);
 
         Box::pin(async move {
             // 0. Upgrade weak reference — fails only during shutdown.
@@ -265,6 +267,28 @@ impl ActionSink for RelayActionSink {
                 Tag::parse(["buzz:workflow", "true"])
                     .map_err(|e| ActionSinkError::EventBuild(format!("workflow tag: {e}")))?,
             ];
+
+            if let Some(recipient_hex) = recipient_pubkey {
+                let recipient = nostr::PublicKey::from_hex(&recipient_hex).map_err(|e| {
+                    ActionSinkError::InvalidInput(format!("invalid recipient pubkey: {e}"))
+                })?;
+                let recipient_hex = recipient.to_hex();
+                let recipient_bytes = recipient.to_bytes();
+                if !state
+                    .is_member_cached(tenant.community(), channel_uuid, &recipient_bytes)
+                    .await
+                    .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                {
+                    return Err(ActionSinkError::InvalidInput(
+                        "approval recipient is not a channel member".into(),
+                    ));
+                }
+                if recipient_hex != author_pubkey_hex {
+                    tags.push(Tag::parse(["p", &recipient_hex]).map_err(|e| {
+                        ActionSinkError::EventBuild(format!("recipient p tag: {e}"))
+                    })?);
+                }
+            }
 
             // Resolve `@Name` mentions to channel-member pubkeys and append a
             // `p` tag for each (skipping the author, already tagged above). A
@@ -676,6 +700,7 @@ mod integration_tests {
                 &channel.id.to_string(),
                 "heads up @Robby — please take a look",
                 &author_hex,
+                None,
             )
             .await
             .expect("send_message");
@@ -707,5 +732,30 @@ mod integration_tests {
             p_tag_targets.contains(&agent_hex.as_str()),
             "mentioned member {agent_hex} must be p-tagged so it wakes; got {p_tag_targets:?}"
         );
+
+        let approval_event_id = sink
+            .send_message(
+                community,
+                &channel.id.to_string(),
+                "Approval requested for run 1",
+                &author_hex,
+                Some(&agent_hex),
+            )
+            .await
+            .expect("send approval notice");
+        let approval_event_bytes = nostr::EventId::from_hex(&approval_event_id)
+            .expect("approval event id")
+            .as_bytes()
+            .to_vec();
+        let approval_event = state
+            .db
+            .get_event_by_id(community, &approval_event_bytes)
+            .await
+            .expect("query approval notice")
+            .expect("approval notice persisted");
+        assert!(approval_event.event.tags.iter().any(|tag| {
+            tag.as_slice().first().map(|s| s.as_str()) == Some("p")
+                && tag.as_slice().get(1).map(|s| s.as_str()) == Some(agent_hex.as_str())
+        }));
     }
 }

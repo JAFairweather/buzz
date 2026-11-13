@@ -196,12 +196,11 @@ pub async fn cmd_approve_step(
     approved: bool,
     note: Option<&str>,
 ) -> Result<(), CliError> {
-    validate_uuid(approval_token)?;
-
     let content = note.unwrap_or("");
 
-    // The relay expects d-tag = hex(SHA256(token)), not the raw token UUID.
-    let token_hash = hex::encode(Sha256::digest(approval_token.as_bytes()));
+    // Requests expose only the hash. Keep accepting a raw UUID for callers
+    // that already hold one, but never require the relay to publish it.
+    let token_hash = approval_reference_hash(approval_token)?;
     let builder =
         buzz_sdk::build_workflow_approval(&token_hash, approved, content).map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
@@ -209,6 +208,39 @@ pub async fn cmd_approve_step(
     let resp = client.submit_event(event).await?;
     println!("{}", normalize_write_response(&resp));
     Ok(())
+}
+
+fn approval_reference_hash(reference: &str) -> Result<String, CliError> {
+    if reference.len() == 64 && reference.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(reference.to_ascii_lowercase())
+    } else {
+        validate_uuid(reference)?;
+        Ok(hex::encode(Sha256::digest(reference.as_bytes())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approval_reference_hash;
+    use sha2::Digest;
+
+    #[test]
+    fn approval_request_hash_is_not_rehashed() {
+        let hash = "ABCDEF0123456789".repeat(4);
+        assert_eq!(
+            approval_reference_hash(&hash).unwrap(),
+            hash.to_ascii_lowercase()
+        );
+    }
+
+    #[test]
+    fn raw_approval_uuid_is_hashed_once() {
+        let token = "00000000-0000-0000-0000-000000000000";
+        assert_eq!(
+            approval_reference_hash(token).unwrap(),
+            hex::encode(sha2::Sha256::digest(token.as_bytes())),
+        );
+    }
 }
 
 pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(), CliError> {
