@@ -15,6 +15,21 @@ ignore = [
     # remove these when upstream catches up.
     { id = "RUSTSEC-2026-0194", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
+    # 2026-11-13: no maintained nostr-relay-pool release is available; retain until the
+    # nostr stack provides a maintained replacement.
+    { id = "RUSTSEC-2026-0243", reason = "nostr-relay-pool is an unavoidable transitive dependency; advisory reports no safe upgrade" },
+    # 2026-11-13: rmcp 3.x fixes this, but the workspace is pinned to the incompatible
+    # rmcp 1.x API and does not enable either affected Streamable HTTP client feature.
+    { id = "RUSTSEC-2026-0462", reason = "rmcp 1.x is required by the current API; affected Streamable HTTP clients are not enabled; track 3.x migration" },
+    # 2026-11-13: serde_yaml is deprecated and unsafe-libyaml has no maintained safe
+    # upgrade; migration to a maintained YAML parser is tracked separately.
+    { id = "RUSTSEC-2024-0449", reason = "transitive via deprecated serde_yaml; no safe upgrade exists; track YAML parser migration" },
+    # 2026-11-13: zip 2.x is pinned transitively by mesh-llm v0.73.1; zip 9.x is
+    # incompatible and unavailable through that upstream constraint. Remove after mesh-llm bumps.
+    { id = "RUSTSEC-2026-0367", reason = "transitive via mesh-llm v0.73.1 pinned to zip 2.x; fixed zip 9.x is not compatible; track upstream bump" },
+    { id = "RUSTSEC-2026-0368", reason = "transitive via mesh-llm v0.73.1 pinned to zip 2.x; fixed zip 9.x is not compatible; track upstream bump" },
+    { id = "RUSTSEC-2026-0369", reason = "transitive via mesh-llm v0.73.1 pinned to zip 2.x; fixed zip 9.x is not compatible; track upstream bump" },
+    { id = "RUSTSEC-2026-0429", reason = "transitive via mesh-llm v0.73.1 pinned to zip 2.x; fixed zip 9.x is not compatible; track upstream bump" },
 ]
 
 [licenses]
