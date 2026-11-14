@@ -1,18 +1,29 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "@/app/App";
+import { NewAppInstallerDownloadHost } from "@/app/NewAppInstallerDownloadHost";
+import { RootErrorBoundary } from "@/app/RootErrorBoundary";
 import { NostrBindConsentDialog } from "@/features/profile/ui/NostrBindConsentDialog";
-import "@fontsource-variable/inter/wght.css";
+import "@fontsource-variable/inter/opsz.css";
+import "@fontsource-variable/inter/opsz-italic.css";
+import "@fontsource/jetbrains-mono/400.css";
+import "@fontsource/jetbrains-mono/700.css";
 import "@/shared/styles/globals.css";
 import { UpdaterProvider } from "@/features/settings/hooks/UpdaterProvider";
 import { migrateLegacyCommunityStorageBeforeRender } from "@/features/communities/legacyCommunityStorage";
 import { CommunitiesProvider } from "@/features/communities/useCommunities";
+import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
 import { CommunityOnboardingProvider } from "@/features/onboarding/communityOnboarding";
 import { ThemeProvider } from "@/shared/theme/ThemeProvider";
+import { AvatarClipPaths } from "@/shared/ui/AvatarClipPaths";
 import { EmojiBurstProvider } from "@/shared/ui/EmojiBurstProvider";
 import { PoofBurstProvider } from "@/shared/ui/PoofBurstProvider";
 import { Toaster } from "@/shared/ui/sonner";
 import { TooltipProvider } from "@/shared/ui/tooltip";
+import { recoverLocalStorageQuotaOnStartup } from "@/shared/lib/localStorageQuota";
+import { startLocalStorageSweep } from "@/shared/lib/localStorageSweep";
+import { initializeConversationDensityPreference } from "@/shared/lib/conversationDensityPreference";
+import { initializeFontSizePreference } from "@/shared/lib/fontSizePreference";
 
 type E2eWindow = Window & {
   __BUZZ_E2E__?: unknown;
@@ -72,23 +83,35 @@ function configureDevE2eBridgeFromUrl() {
 function renderApp() {
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
-      <CommunitiesProvider>
-        <CommunityOnboardingProvider>
-          <ThemeProvider defaultTheme="buzz">
-            <TooltipProvider delayDuration={300}>
-              <EmojiBurstProvider>
-                <PoofBurstProvider>
-                  <UpdaterProvider>
-                    <App />
-                    <NostrBindConsentDialog />
-                  </UpdaterProvider>
-                  <Toaster />
-                </PoofBurstProvider>
-              </EmojiBurstProvider>
-            </TooltipProvider>
-          </ThemeProvider>
-        </CommunityOnboardingProvider>
-      </CommunitiesProvider>
+      {/* block/buzz#5078 — catch any uncaught render error so a WebKit
+          SecurityError from localStorage can't blank the whole window. */}
+      <RootErrorBoundary>
+        <AvatarClipPaths />
+        <CommunitiesProvider>
+          <CommunityOnboardingProvider
+            enabled={huddleWindowChannelId() === null}
+          >
+            <ThemeProvider defaultTheme="buzz">
+              <TooltipProvider>
+                <EmojiBurstProvider>
+                  <PoofBurstProvider>
+                    <UpdaterProvider>
+                      <App />
+                      <NostrBindConsentDialog />
+                      {/* The huddle window never shows the banner, and a
+                          second host would cancel the main window's download. */}
+                      {huddleWindowChannelId() === null ? (
+                        <NewAppInstallerDownloadHost />
+                      ) : null}
+                    </UpdaterProvider>
+                    <Toaster />
+                  </PoofBurstProvider>
+                </EmojiBurstProvider>
+              </TooltipProvider>
+            </ThemeProvider>
+          </CommunityOnboardingProvider>
+        </CommunitiesProvider>
+      </RootErrorBoundary>
     </React.StrictMode>,
   );
 }
@@ -110,6 +133,10 @@ async function installE2eBridgeIfConfigured() {
 async function bootstrap() {
   resetDevWebviewStateFromUrl();
   configureDevE2eBridgeFromUrl();
+  recoverLocalStorageQuotaOnStartup();
+  initializeConversationDensityPreference();
+  initializeFontSizePreference();
+  startLocalStorageSweep();
   await installE2eBridgeIfConfigured();
   await migrateLegacyCommunityStorageBeforeRender();
   renderApp();

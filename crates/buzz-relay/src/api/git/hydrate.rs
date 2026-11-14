@@ -243,7 +243,7 @@ pub async fn hydrate_for_write(
 ///
 /// `Ok(None)` if the pointer is absent (caller decides 404 vs first-push
 /// per call site). `Err(_)` on any below-pointer failure.
-async fn load_pointer(
+pub(super) async fn load_pointer(
     store: &GitStore,
     ctx: &TenantContext,
     owner: &str,
@@ -543,14 +543,22 @@ mod tests {
     #[tokio::test]
     async fn materialized_repo_is_created_under_configured_scratch_dir() {
         let scratch = TempDir::new().unwrap();
-        let store = GitStore::new("http://localhost:9000", "x", "x", "x", "us-east-1")
-            .expect("construct store");
+        let store = GitStore::new(
+            "http://localhost:9000",
+            "x",
+            "x",
+            "x",
+            "us-east-1",
+            buzz_media::config::S3AddressingStyle::Path,
+        )
+        .expect("construct store");
         let manifest = Manifest {
             version: 1,
             head: "refs/heads/main".into(),
             refs: BTreeMap::new(),
             packs: Vec::new(),
             parent: None,
+            published_at: None,
         };
         let cache = GitPackCache::new(scratch.path(), u64::MAX, 2).expect("cache");
 
@@ -587,8 +595,9 @@ mod tests {
             "buzz_dev_secret",
             "buzz-git",
             "us-east-1",
+            buzz_media::config::S3AddressingStyle::Path,
         )
-        .expect("connect minio")
+        .expect("connect local MinIO")
     }
 
     /// Build a tiny on-disk repo, return (pack bytes, head_oid).
@@ -658,6 +667,7 @@ mod tests {
             refs,
             packs: vec![pack_key.clone()],
             parent: None,
+            published_at: None,
         };
         let manifest_bytes = manifest.canonical_bytes().expect("serialize");
         let manifest_key = st
@@ -806,6 +816,7 @@ mod tests {
             refs: BTreeMap::new(),
             packs: vec![],
             parent: None,
+            published_at: None,
         };
         let manifest_bytes = manifest.canonical_bytes().expect("serialize");
         let manifest_key = st

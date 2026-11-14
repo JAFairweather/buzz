@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use buzz_media::S3AddressingStyle;
 use nostr::{EventBuilder, Keys, Kind, Tag};
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
@@ -59,6 +60,27 @@ async fn post_event(event: &nostr::Event) {
         "event rejected: {}",
         resp.text().await.unwrap_or_default()
     );
+}
+
+/// Create a channel (kind:9007) owned by `keys` and return its UUID.
+///
+/// The git read gate (SEC-005) authorizes against membership in the channel
+/// named by the announcement's `buzz-channel` tag, so every repo these tests
+/// announce must be bound to a channel its owner belongs to — creating the
+/// channel makes the creator its owner-member.
+async fn create_test_channel(keys: &Keys) -> String {
+    let channel_uuid = uuid::Uuid::new_v4().to_string();
+    let event = EventBuilder::new(Kind::Custom(9007), "")
+        .tags(vec![
+            Tag::parse(["h", &channel_uuid]).unwrap(),
+            Tag::parse(["name", &format!("git-e2e-{channel_uuid}")]).unwrap(),
+            Tag::parse(["channel_type", "stream"]).unwrap(),
+            Tag::parse(["visibility", "open"]).unwrap(),
+        ])
+        .sign_with_keys(keys)
+        .unwrap();
+    post_event(&event).await;
+    channel_uuid
 }
 
 /// Run `git` with the Buzz credential helper and isolated config.
@@ -115,29 +137,55 @@ struct PointerSnapshot {
 }
 
 impl GitS3Probe {
-    fn from_env() -> Self {
-        let endpoint = std::env::var("BUZZ_GIT_S3_ENDPOINT")
-            .or_else(|_| std::env::var("BUZZ_S3_ENDPOINT"))
-            .unwrap_or_else(|_| "http://localhost:9000".to_string());
-        let access_key = std::env::var("BUZZ_GIT_S3_ACCESS_KEY")
-            .or_else(|_| std::env::var("BUZZ_S3_ACCESS_KEY"))
-            .unwrap_or_else(|_| "buzz_dev".to_string());
-        let secret_key = std::env::var("BUZZ_GIT_S3_SECRET_KEY")
-            .or_else(|_| std::env::var("BUZZ_S3_SECRET_KEY"))
-            .unwrap_or_else(|_| "buzz_dev_secret".to_string());
-        let bucket = std::env::var("BUZZ_GIT_S3_BUCKET")
-            .or_else(|_| std::env::var("BUZZ_S3_BUCKET"))
-            .unwrap_or_else(|_| "buzz-media".to_string());
-
+    fn bucket(
+        endpoint: String,
+        access_key: &str,
+        secret_key: &str,
+        bucket_name: &str,
+        region_name: String,
+        addressing_style: S3AddressingStyle,
+    ) -> Box<Bucket> {
         let region = Region::Custom {
-            region: "us-east-1".into(),
+            region: region_name,
             endpoint,
         };
-        let creds = Credentials::new(Some(&access_key), Some(&secret_key), None, None, None)
+        let creds = Credentials::new(Some(access_key), Some(secret_key), None, None, None)
             .expect("S3 credentials");
-        let bucket = Bucket::new(&bucket, region, creds)
-            .expect("S3 bucket")
-            .with_path_style();
+        let bucket = Bucket::new(bucket_name, region, creds).expect("S3 bucket");
+        match addressing_style {
+            S3AddressingStyle::Path => bucket.with_path_style(),
+            S3AddressingStyle::Virtual => bucket,
+        }
+    }
+
+    fn from_env() -> Self {
+        // These E2E assertions inspect the relay's backing bucket directly, so
+        // they must receive the same provider connection and URL style as the
+        // relay. Unit/live MinIO probes in buzz-relay keep explicit local
+        // fixtures and do not need provider overrides.
+        let endpoint = std::env::var("BUZZ_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://localhost:9000".to_string());
+        let access_key =
+            std::env::var("BUZZ_S3_ACCESS_KEY").unwrap_or_else(|_| "buzz_dev".to_string());
+        let secret_key =
+            std::env::var("BUZZ_S3_SECRET_KEY").unwrap_or_else(|_| "buzz_dev_secret".to_string());
+        let bucket_name =
+            std::env::var("BUZZ_S3_BUCKET").unwrap_or_else(|_| "buzz-media".to_string());
+        let region_name =
+            std::env::var("BUZZ_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let addressing_style = std::env::var("BUZZ_S3_ADDRESSING_STYLE")
+            .unwrap_or_else(|_| "path".to_string())
+            .parse::<S3AddressingStyle>()
+            .expect("BUZZ_S3_ADDRESSING_STYLE must be 'path' or 'virtual'");
+
+        let bucket = Self::bucket(
+            endpoint,
+            &access_key,
+            &secret_key,
+            &bucket_name,
+            region_name,
+            addressing_style,
+        );
         Self { bucket }
     }
 
@@ -192,6 +240,31 @@ impl GitS3Probe {
     }
 }
 
+#[test]
+fn git_s3_probe_builds_both_addressing_styles() {
+    let path = GitS3Probe::bucket(
+        "https://storage.example".to_string(),
+        "access",
+        "secret",
+        "buzz-media",
+        "us-east-1".to_string(),
+        S3AddressingStyle::Path,
+    );
+    assert!(path.is_path_style());
+    assert_eq!(path.url(), "https://storage.example/buzz-media");
+
+    let virtual_hosted = GitS3Probe::bucket(
+        "https://storage.example".to_string(),
+        "access",
+        "secret",
+        "buzz-media",
+        "auto".to_string(),
+        S3AddressingStyle::Virtual,
+    );
+    assert!(virtual_hosted.is_subdomain_style());
+    assert_eq!(virtual_hosted.url(), "https://buzz-media.storage.example");
+}
+
 #[tokio::test]
 #[ignore = "requires live relay + MinIO + git"]
 async fn git_clone_push_fetch_force_roundtrip() {
@@ -204,10 +277,15 @@ async fn git_clone_push_fetch_force_roundtrip() {
     let s3 = GitS3Probe::from_env();
 
     // Announce the repo (kind:30617) so the relay creates the bare repo + hook.
+    // The `buzz-channel` binding is the repo's ACL: without it the read gate
+    // 404s even for the owner (issue #3527), so bind to a channel the owner
+    // just created (and therefore belongs to).
+    let channel = create_test_channel(&owner).await;
     let announce = EventBuilder::new(Kind::from(30617), "")
         .tags(vec![
             Tag::parse(["d", &repo]).unwrap(),
             Tag::parse(["name", "e2e git repo"]).unwrap(),
+            Tag::parse(["buzz-channel", &channel]).unwrap(),
         ])
         .sign_with_keys(&owner)
         .unwrap();
@@ -341,10 +419,12 @@ async fn git_concurrent_push_one_wins_and_repo_recovers() {
     let repo = format!("e2e-git-concurrent-{}", std::process::id());
     let s3 = GitS3Probe::from_env();
 
+    let channel = create_test_channel(&owner).await;
     let announce = EventBuilder::new(Kind::from(30617), "")
         .tags(vec![
             Tag::parse(["d", &repo]).unwrap(),
             Tag::parse(["name", "e2e concurrent git repo"]).unwrap(),
+            Tag::parse(["buzz-channel", &channel]).unwrap(),
         ])
         .sign_with_keys(&owner)
         .unwrap();
@@ -449,6 +529,99 @@ async fn git_concurrent_push_one_wins_and_repo_recovers() {
         log.contains("contender"),
         "published head is one contender: {log}"
     );
+}
+
+/// A non-atomic multi-ref push can be partially accepted: git applies each ref
+/// update independently and reports `ok` for the refs it applied. The relay
+/// must publish those refs, or the client records an update that never landed.
+#[tokio::test]
+#[ignore = "requires live relay + MinIO + git"]
+async fn git_partial_push_publishes_accepted_refs() {
+    use nostr::ToBech32;
+
+    let owner = Keys::generate();
+    let owner_hex = owner.public_key().to_hex();
+    let owner_nsec = owner.secret_key().to_bech32().unwrap();
+    let repo = format!("e2e-git-partial-{}", std::process::id());
+    let s3 = GitS3Probe::from_env();
+
+    let channel = create_test_channel(&owner).await;
+    let announce = EventBuilder::new(Kind::from(30617), "")
+        .tags(vec![
+            Tag::parse(["d", &repo]).unwrap(),
+            Tag::parse(["name", "e2e partial push repo"]).unwrap(),
+            Tag::parse(["buzz-channel", &channel]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .unwrap();
+    post_event(&announce).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let tmp = tempdir_named("buzz-e2e-git-partial");
+    let url = format!("{}/git/{}/{}", relay_http_url(), owner_hex, repo);
+
+    git(&["clone", "--quiet", &url, "work"], tmp.path(), &owner_nsec);
+    let work = tmp.path().join("work");
+    std::fs::write(work.join("README.md"), "base\n").unwrap();
+    git(&["add", "."], &work, &owner_nsec);
+    git(&["commit", "--quiet", "-m", "base"], &work, &owner_nsec);
+    git(&["branch", "-M", "main"], &work, &owner_nsec);
+    git(
+        &["push", "--quiet", "origin", "main", "main:feature"],
+        &work,
+        &owner_nsec,
+    );
+    let base_pointer = s3.require_pointer(&owner_hex, &repo).await;
+
+    // `feature/x` conflicts with the existing `feature` branch, so git rejects
+    // it while applying the fast-forward of `main`.
+    std::fs::write(work.join("README.md"), "base\nnext\n").unwrap();
+    git(&["commit", "--quiet", "-am", "next"], &work, &owner_nsec);
+    let next_sha = git(&["rev-parse", "main"], &work, &owner_nsec)
+        .trim()
+        .to_string();
+    let out = git_status(
+        &["push", "origin", "main", "main:refs/heads/feature/x"],
+        &work,
+        &owner_nsec,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "feature/x must be rejected: {stderr}"
+    );
+    assert!(
+        stderr.contains("main -> main"),
+        "client reports main as pushed: {stderr}"
+    );
+
+    let after_pointer = s3.require_pointer(&owner_hex, &repo).await;
+    assert_ne!(
+        after_pointer, base_pointer,
+        "the accepted main update must advance the S3 manifest pointer"
+    );
+    git(
+        &["clone", "--quiet", &url, "after"],
+        tmp.path(),
+        &owner_nsec,
+    );
+    let after = tmp.path().join("after");
+    assert_eq!(
+        git(&["rev-parse", "main"], &after, &owner_nsec).trim(),
+        next_sha,
+        "a fresh clone sees the main update the client was told landed"
+    );
+    let feature_x = git_status(
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/feature/x",
+        ],
+        &after,
+        &owner_nsec,
+    );
+    assert!(!feature_x.status.success(), "rejected feature/x is absent");
 }
 
 struct TempDir(PathBuf);

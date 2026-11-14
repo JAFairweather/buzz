@@ -31,28 +31,6 @@ class ThemeColors {
       .join(' ');
 }
 
-/// Known light theme names — used to show sun/moon icons before loading.
-const lightThemeNames = <String>{
-  'catppuccin-latte',
-  'everforest-light',
-  'github-light',
-  'github-light-default',
-  'github-light-high-contrast',
-  'gruvbox-light-hard',
-  'gruvbox-light-medium',
-  'gruvbox-light-soft',
-  'kanagawa-lotus',
-  'light-plus',
-  'material-theme-lighter',
-  'min-light',
-  'one-light',
-  'rose-pine-dawn',
-  'slack-ochin',
-  'snazzy-light',
-  'solarized-light',
-  'vitesse-light',
-};
-
 /// All available color schemes, sorted alphabetically.
 const themeCatalog = <ThemeColors>[
   ThemeColors(
@@ -78,6 +56,25 @@ const themeCatalog = <ThemeColors>[
     comment: Color(0xFF5A6673),
     added: Color(0xFF70BF56),
     deleted: Color(0xFFF26D78),
+  ),
+  // Buzz and Buzz Dark are first-party: they borrow the GitHub Light / GitHub
+  // Dark palettes wholesale and are distinguished only by the branded gradient
+  // painted across the app's top section (see buzz_theme.dart).
+  ThemeColors(
+    name: 'buzz',
+    bg: Color(0xFFFFFFFF),
+    fg: Color(0xFF24292E),
+    comment: Color(0xFF6A737D),
+    added: Color(0xFF28A745),
+    deleted: Color(0xFFD73A49),
+  ),
+  ThemeColors(
+    name: 'buzz-dark',
+    bg: Color(0xFF24292E),
+    fg: Color(0xFFE1E4E8),
+    comment: Color(0xFF6A737D),
+    added: Color(0xFF34D058),
+    deleted: Color(0xFFEA4A5A),
   ),
   ThemeColors(
     name: 'catppuccin-frappe',

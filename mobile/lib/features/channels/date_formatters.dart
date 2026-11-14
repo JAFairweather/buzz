@@ -4,9 +4,35 @@ import 'package:intl/intl.dart';
 // Re-export shortPubkey so existing callers continue to compile.
 export '../../shared/utils/string_utils.dart' show shortPubkey;
 
-final _fullDateFormat = DateFormat('EEEE, MMMM d, y');
+final _weekdayFormat = DateFormat('EEEE');
+final _weekdayMonthDayFormat = DateFormat('EEEE, MMMM d');
+final _monthDayYearFormat = DateFormat('MMMM d, y');
+final _messageTimeFormat = DateFormat('h:mm a', 'en_US');
 
-/// Returns "Today", "Yesterday", or a full date like "Monday, March 31, 2026".
+/// Days in a week, past which the weekday name stops being unambiguous.
+const _weekdayBandDays = 7;
+
+/// Label for a day divider: "Today", "Yesterday", "Monday",
+/// "Tuesday, March 31", or "March 31, 2025".
+///
+/// ```
+/// Today            → "Today"
+/// Yesterday        → "Yesterday"
+/// 2–6 days ago     → "Monday"
+/// older, this year → "Tuesday, March 31"
+/// earlier years    → "March 31, 2025"
+/// ```
+///
+/// The weekday rides along within the current year — it still orients ("was
+/// that a weekend?") well past the six-day band. Beyond a year it stops
+/// earning its width, and the year takes its place.
+///
+/// Mirrors `formatDayGroupLabel` in `desktop/src/shared/lib/datetime.ts`,
+/// including its two departures from the Block writing standard: the day is
+/// kept in the oldest band rather than collapsing to month-and-year, because a
+/// divider has to *identify* its day — collapsing would give every day in a
+/// month the same header. And there is no ordinal suffix ("March 31", never
+/// "March 31st"), which the standard does ask for.
 ///
 /// [now] is exposed for testing; production callers should omit it.
 String formatDayHeading(int unixSeconds, {@visibleForTesting DateTime? now}) {
@@ -15,21 +41,28 @@ String formatDayHeading(int unixSeconds, {@visibleForTesting DateTime? now}) {
     isUtc: true,
   ).toLocal();
   now ??= DateTime.now();
-  final today = DateTime(now.year, now.month, now.day);
-  final messageDay = DateTime(date.year, date.month, date.day);
+  final dayDiff = _calendarDaysBetween(now, date);
 
-  if (today.year == messageDay.year &&
-      today.month == messageDay.month &&
-      today.day == messageDay.day) {
-    return 'Today';
+  if (dayDiff == 0) return 'Today';
+  if (dayDiff == 1) return 'Yesterday';
+  // Bounded below as well as above: a timestamp in the future (clock skew, or a
+  // relay ahead of this device) must not be labelled with a weekday that reads
+  // as the recent past.
+  if (dayDiff > 1 && dayDiff < _weekdayBandDays) {
+    return _weekdayFormat.format(date);
   }
-  final yesterday = DateTime(now.year, now.month, now.day - 1);
-  if (yesterday.year == messageDay.year &&
-      yesterday.month == messageDay.month &&
-      yesterday.day == messageDay.day) {
-    return 'Yesterday';
-  }
-  return _fullDateFormat.format(date);
+
+  return date.year == now.year
+      ? _weekdayMonthDayFormat.format(date)
+      : _monthDayYearFormat.format(date);
+}
+
+/// Whole calendar days from [date] to [now], in local time. Rounded rather than
+/// truncated so a DST transition — a 23- or 25-hour day — still counts as one.
+int _calendarDaysBetween(DateTime now, DateTime date) {
+  final startOfNow = DateTime(now.year, now.month, now.day);
+  final startOfDate = DateTime(date.year, date.month, date.day);
+  return (startOfNow.difference(startOfDate).inHours / 24).round();
 }
 
 /// Whether two unix-second timestamps fall on the same calendar day (local time).
@@ -62,20 +95,17 @@ String relativeTime(int unixSeconds) {
   return '${time.month}/${time.day}/${time.year}';
 }
 
-/// Compact time label: "HH:MM" for today, "M/D HH:MM" for older messages.
+/// Desktop-parity message clock time, e.g. "2:34 PM".
+///
+/// Deliberately clock-only at every band, unlike desktop's message header,
+/// which reads "Yesterday at 2:34 PM". Mobile timestamps sit inside a chat
+/// bubble on a narrow screen with the day divider a short scroll away, so this
+/// is the compact side of that split — not an oversight. Change it only
+/// alongside a layout that has room for a date.
 String formatMessageTime(int unixSeconds) {
-  final dt = DateTime.fromMillisecondsSinceEpoch(
+  final date = DateTime.fromMillisecondsSinceEpoch(
     unixSeconds * 1000,
     isUtc: true,
   ).toLocal();
-  final now = DateTime.now();
-  final diff = now.difference(dt);
-
-  final hh = dt.hour.toString().padLeft(2, '0');
-  final mm = dt.minute.toString().padLeft(2, '0');
-
-  if (diff.inDays > 0) {
-    return '${dt.month}/${dt.day} $hh:$mm';
-  }
-  return '$hh:$mm';
+  return _messageTimeFormat.format(date);
 }

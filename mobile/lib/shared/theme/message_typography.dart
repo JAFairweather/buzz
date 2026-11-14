@@ -1,0 +1,133 @@
+import 'package:flutter/material.dart';
+
+import 'grid.dart';
+
+const _fontFamily = 'Inter';
+
+/// Avatar size for full channel and thread messages.
+const messageAvatarSize = 36.0;
+
+/// Avatar size for conversation-oriented Activity rows.
+const activityAvatarSize = 42.0;
+
+/// Avatar size for compact message-result rows.
+const compactMessageAvatarSize = 42.0;
+
+/// Horizontal space between a message avatar and its content.
+const messageAvatarContentGap = Grid.twelve;
+
+/// Maximum text-bubble width relative to the screen, including padding.
+const messageTextMaxWidthFraction = 2 / 3;
+
+/// Primary message copy: 15sp regular on a 20sp line height.
+const messageBodyTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 15,
+  fontWeight: FontWeight.w400,
+  height: 20 / 15,
+  letterSpacing: 0,
+);
+
+/// Message author names: 15sp semibold on a 17sp line height.
+const messageUsernameTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 15,
+  fontWeight: FontWeight.w600,
+  height: 17 / 15,
+  letterSpacing: 0,
+);
+
+/// Secondary author metadata: 15sp regular on a tight 17sp line height.
+const messageMetadataTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 15,
+  fontWeight: FontWeight.w400,
+  height: 17 / 15,
+  letterSpacing: 0,
+);
+
+/// Message timestamps: 13.1sp regular, one step below 15sp author names.
+const messageTimestampTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 13.1,
+  fontWeight: FontWeight.w400,
+  height: 17 / 13.1,
+  letterSpacing: 0,
+);
+
+/// Reaction counts: 13.1sp medium on a 17sp line height.
+const reactionCountTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 13.1,
+  fontWeight: FontWeight.w500,
+  height: 17 / 13.1,
+  letterSpacing: 0,
+);
+
+/// Channel and thread titles: 20sp bold on a 24sp line height.
+const channelTitleTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 20,
+  fontWeight: FontWeight.w700,
+  height: 24 / 20,
+  letterSpacing: 0,
+);
+
+/// Primary labels in compact content lists.
+const contentListTitleTextStyle = messageUsernameTextStyle;
+
+/// Titles shared by Home channel rows and Solo chat rows.
+const navigationChatTitleTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 17,
+  fontWeight: FontWeight.w400,
+  height: 22 / 17,
+  letterSpacing: 0,
+);
+
+/// Secondary copy in compact content lists.
+const contentListBodyTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 13.1,
+  fontWeight: FontWeight.w400,
+  height: 17 / 13.1,
+  letterSpacing: 0,
+);
+
+/// Filter chip labels use a tighter 15sp Inter treatment.
+const filterChipTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 15,
+  fontWeight: FontWeight.w400,
+  height: 1,
+  letterSpacing: 0,
+);
+
+/// Search fields use the primary 15sp body treatment.
+const searchInputTextStyle = messageBodyTextStyle;
+
+/// Activity sender names share the primary author style.
+const activityUsernameTextStyle = messageUsernameTextStyle;
+
+/// Activity timestamps share the compact message timestamp treatment.
+const activityTimestampTextStyle = messageTimestampTextStyle;
+
+/// Activity context labels: 13.1sp medium on a 17sp line height.
+const activityContextTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 13.1,
+  fontWeight: FontWeight.w500,
+  height: 17 / 13.1,
+  letterSpacing: 0,
+);
+
+/// Activity message previews use the primary message copy style.
+const activityPreviewTextStyle = messageBodyTextStyle;
+
+/// Inventory labels shared by Solo and Team navigation sections.
+const navigationSectionTextStyle = TextStyle(
+  fontFamily: _fontFamily,
+  fontSize: 15,
+  height: 20 / 15,
+  fontWeight: FontWeight.w500,
+);
