@@ -69,14 +69,43 @@ jobs:
           file "out/buzz-acp-$TARGET" | grep -q 'statically linked' || { echo "::error::buzz-acp is not statically linked"; exit 1; }
           (cd out && sha256sum "buzz-acp-$TARGET" > "buzz-acp-$TARGET.sha256")
           cat "out/buzz-acp-$TARGET.sha256"
+      - name: Pin the tag to this commit before publishing
+        # gh release create --target only applies when the tag does not exist yet (Murphy on PR 6), so the tag is
+        # settled first: an existing tag must already name exactly $COMMIT, otherwise this run creates it there.
+        run: |
+          tag_commit() {  # the commit refs/tags/$TAG names, peeling annotated tags; empty if there is no such tag
+            local obj type sha
+            obj=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" \
+              --jq ".[] | select(.ref == \"refs/tags/$TAG\") | \"\\(.object.type) \\(.object.sha)\"")
+            [ -n "$obj" ] || return 0
+            read -r type sha <<< "$obj"
+            while [ "$type" = tag ]; do
+              read -r type sha <<< "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '"\(.object.type) \(.object.sha)"')"
+            done
+            [ "$type" = commit ] || { echo "::error::tag $TAG names a $type, not a commit"; exit 1; }
+            echo "$sha"
+          }
+          tagged=$(tag_commit)
+          if [ -z "$tagged" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$COMMIT" >/dev/null \
+              || { echo "::error::could not create tag $TAG at $COMMIT"; exit 1; }
+            tagged=$(tag_commit)
+          fi
+          test "$tagged" = "$COMMIT" || { echo "::error::tag $TAG names ${tagged:-nothing}, not $COMMIT; nothing published"; exit 1; }
+          echo "$TAG -> $tagged"
       - name: Publish the release
         run: |
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$COMMIT" \
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "buzz-acp at ${COMMIT:0:12}" \
             --notes "buzz-acp ($TARGET), built from $COMMIT on $DEPLOY_BRANCH by run $GITHUB_RUN_ID. Install only with herd-infra install-buzz-agents --buzz-acp-release and a digest checked separately." \
             "out/buzz-acp-$TARGET" "out/buzz-acp-$TARGET.sha256"
-      - name: Check the release tag names exactly this commit
+      - name: Check the release tag still names exactly this commit
         run: |
-          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
-          test "$tagged" = "$COMMIT" || { echo "::error::tag $TAG resolves to $tagged, not $COMMIT"; exit 1; }
-          echo "$TAG -> $tagged"
+          obj=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" \
+            --jq ".[] | select(.ref == \"refs/tags/$TAG\") | \"\\(.object.type) \\(.object.sha)\"")
+          read -r type sha <<< "$obj"
+          while [ "$type" = tag ]; do
+            read -r type sha <<< "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '"\(.object.type) \(.object.sha)"')"
+          done
+          test "$type" = commit && test "$sha" = "$COMMIT" || { echo "::error::tag $TAG resolves to ${type:-nothing} ${sha:-}, not $COMMIT"; exit 1; }
+          echo "$TAG -> $sha"
