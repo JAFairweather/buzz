@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Keep Buzz's direct rmcp runtime on the child-process transport only.
+
+The RustSec rmcp advisory concerns the Streamable HTTP client. Buzz's direct
+MCP client is intentionally child-process-only; mesh-llm-host-runtime remains
+an explicitly tracked transitive exception and is not silently declared safe.
+"""
+from pathlib import Path
+
+root = Path(__file__).resolve().parents[1]
+workspace = (root / "Cargo.toml").read_text()
+relay_manifest = (root / "crates/buzz-relay/Cargo.toml").read_text()
+agent_manifest = (root / "crates/buzz-agent/Cargo.toml").read_text()
+agent_mcp = (root / "crates/buzz-agent/src/mcp.rs").read_text()
+
+def check(condition, message):
+    if not condition:
+        raise SystemExit(f"FAIL: {message}")
+    print(f"ok - {message}")
+
+check('rmcp = { version = "1", default-features = false, features = ["client", "transport-child-process"] }' in agent_manifest,
+      "buzz-agent enables rmcp client only with child-process transport")
+check("TokioChildProcess" in agent_mcp,
+      "buzz-agent constructs the child-process transport")
+check("streamable-http" not in agent_manifest and "transport-streamable-http" not in agent_manifest,
+      "buzz-agent does not enable an HTTP rmcp transport")
+check('mesh-llm-host-runtime' in relay_manifest,
+      "mesh-llm host runtime remains visible for explicit advisory tracking")
+print("rmcp-transport-boundary: all checks passed")

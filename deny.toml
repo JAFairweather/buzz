@@ -21,7 +21,7 @@ ignore = [
     # 2026-11-13: rmcp 3.x fixes this, but the workspace is pinned to the incompatible
     # rmcp 1.x API. The transitive mesh-llm host enables the affected HTTP client, so this
     # is an explicit temporary exception for the required API migration, not an unreachable-path claim.
-    { id = "RUSTSEC-2026-0462", reason = "transitive rmcp 1.x is reachable through mesh-llm; rmcp 3.x requires an incompatible API migration; track and remove after migration" },
+    { id = "RUSTSEC-2026-0462", reason = "direct Buzz rmcp uses only the child-process transport (tests/rmcp-transport-boundary); the reachable mesh-llm host runtime still carries the Streamable HTTP client, and rmcp 3.x requires an incompatible API migration; track and remove after migration" },
     # 2026-11-13: serde_yaml is deprecated and unsafe-libyaml has no maintained safe
     # upgrade; migration to a maintained YAML parser is tracked separately.
     { id = "RUSTSEC-2024-0449", reason = "transitive via deprecated serde_yaml; no safe upgrade exists; track YAML parser migration" },
