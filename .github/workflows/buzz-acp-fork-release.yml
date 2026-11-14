@@ -1,0 +1,111 @@
+# buzz-acp fork release: builds buzz-acp for herd-cloud from one reviewed commit on the deploy branch and
+# publishes it, with its SHA-256, as a GitHub release tagged with that commit. herd-infra's install-buzz-agents
+# --buzz-acp-release installs it only when the digest matches one supplied separately at install time (Hive
+# buzz-acp-fork-release-deploy-route, My Dude, 14 Nov). The deploy branch is herd/0.5.28: upstream
+# desktop-v0.5.28, the release herd-cloud runs, plus reviewed fixes. Fork main is far older and is never released.
+# Run by hand from main; it never overwrites an existing release.
+name: buzz-acp fork release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-hex SHA of a reviewed commit on herd/0.5.28
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: buzz-acp-fork-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish buzz-acp (x86_64 musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      COMMIT: ${{ inputs.commit }}
+      TARGET: x86_64-unknown-linux-musl
+      DEPLOY_BRANCH: herd/0.5.28
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check the commit input
+        run: |
+          if ! printf '%s' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::commit must be a full 40-hex SHA"; exit 1
+          fi
+          echo "TAG=buzz-acp-$COMMIT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.DEPLOY_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a commit on the deploy branch, and no existing release for it
+        run: |
+          git fetch --no-tags origin "+refs/heads/$DEPLOY_BRANCH:refs/remotes/origin/$DEPLOY_BRANCH"
+          git cat-file -e "$COMMIT^{commit}" || { echo "::error::$COMMIT is not in this repository"; exit 1; }
+          git merge-base --is-ancestor "$COMMIT" "origin/$DEPLOY_BRANCH" || { echo "::error::$COMMIT is not on $DEPLOY_BRANCH"; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists; a release is never replaced"; exit 1
+          fi
+          git checkout --detach "$COMMIT"
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Install cross
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
+        with:
+          tool: cross@0.2.5
+      - name: Build buzz-acp
+        run: cross build --release --locked --target "$TARGET" -p buzz-acp
+      - name: Stage the binary and its digest
+        run: |
+          mkdir -p out
+          cp "target/$TARGET/release/buzz-acp" "out/buzz-acp-$TARGET"
+          file "out/buzz-acp-$TARGET" | grep -q 'statically linked' || { echo "::error::buzz-acp is not statically linked"; exit 1; }
+          (cd out && sha256sum "buzz-acp-$TARGET" > "buzz-acp-$TARGET.sha256")
+          cat "out/buzz-acp-$TARGET.sha256"
+      - name: Pin the tag to this commit before publishing
+        # gh release create --target only applies when the tag does not exist yet (Murphy on PR 6), so the tag is
+        # settled first: an existing tag must already name exactly $COMMIT, otherwise this run creates it there.
+        run: |
+          tag_commit() {  # the commit refs/tags/$TAG names, peeling annotated tags; empty if there is no such tag
+            local obj type sha
+            obj=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" \
+              --jq ".[] | select(.ref == \"refs/tags/$TAG\") | \"\\(.object.type) \\(.object.sha)\"")
+            [ -n "$obj" ] || return 0
+            read -r type sha <<< "$obj"
+            while [ "$type" = tag ]; do
+              read -r type sha <<< "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '"\(.object.type) \(.object.sha)"')"
+            done
+            [ "$type" = commit ] || { echo "::error::tag $TAG names a $type, not a commit"; exit 1; }
+            echo "$sha"
+          }
+          tagged=$(tag_commit)
+          if [ -z "$tagged" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$COMMIT" >/dev/null \
+              || { echo "::error::could not create tag $TAG at $COMMIT"; exit 1; }
+            tagged=$(tag_commit)
+          fi
+          test "$tagged" = "$COMMIT" || { echo "::error::tag $TAG names ${tagged:-nothing}, not $COMMIT; nothing published"; exit 1; }
+          echo "$TAG -> $tagged"
+      - name: Publish the release
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "buzz-acp at ${COMMIT:0:12}" \
+            --notes "buzz-acp ($TARGET), built from $COMMIT on $DEPLOY_BRANCH by run $GITHUB_RUN_ID. Install only with herd-infra install-buzz-agents --buzz-acp-release and a digest checked separately." \
+            "out/buzz-acp-$TARGET" "out/buzz-acp-$TARGET.sha256"
+      - name: Check the release tag still names exactly this commit
+        run: |
+          obj=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" \
+            --jq ".[] | select(.ref == \"refs/tags/$TAG\") | \"\\(.object.type) \\(.object.sha)\"")
+          read -r type sha <<< "$obj"
+          while [ "$type" = tag ]; do
+            read -r type sha <<< "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '"\(.object.type) \(.object.sha)"')"
+          done
+          test "$type" = commit && test "$sha" = "$COMMIT" || { echo "::error::tag $TAG resolves to ${type:-nothing} ${sha:-}, not $COMMIT"; exit 1; }
+          echo "$TAG -> $sha"
