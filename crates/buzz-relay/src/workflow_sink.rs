@@ -874,7 +874,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod postgres_tests {
+pub(crate) mod postgres_tests {
     //! Regression test for `e3661764` / `7899c1a8`: a workflow `send_message`
     //! that mentions a channel member by name (`@Name`) in its author-written
     //! step template must emit both the legacy `p` tag and authenticated
@@ -889,7 +889,7 @@ mod postgres_tests {
     use std::sync::Arc;
 
     /// Real-PG state mirroring `handlers::event::tests::test_state_with_redis_url`.
-    async fn test_state() -> Arc<AppState> {
+    pub(crate) async fn test_state() -> Arc<AppState> {
         test_state_with_agent_mentions(buzz_workflow::AgentMentions::Any).await
     }
 
@@ -1133,7 +1133,6 @@ mod postgres_tests {
                 None,
                 &author.public_key().to_bytes(),
                 None,
-                None,
             )
             .await
             .expect("create channel");
@@ -1275,16 +1274,7 @@ mod postgres_tests {
             .await
             .expect("send approval notice")
             .event_id;
-        let notice_bytes = nostr::EventId::from_hex(&notice_id)
-            .expect("notice id")
-            .as_bytes()
-            .to_vec();
-        let notice = state
-            .db
-            .get_event_by_id(community, &notice_bytes)
-            .await
-            .expect("query notice")
-            .expect("notice persisted");
+        let notice = load_event(&notice_id).await;
         assert!(tag_values(&notice, "p").contains(&agent_hex));
     }
 
@@ -1317,7 +1307,6 @@ mod postgres_tests {
                 ChannelVisibility::Open,
                 None,
                 &author.public_key().to_bytes(),
-                None,
                 None,
             )
             .await
@@ -1442,7 +1431,6 @@ mod postgres_tests {
                 ChannelVisibility::Open,
                 None,
                 &author.public_key().to_bytes(),
-                None,
                 None,
             )
             .await
@@ -1727,7 +1715,6 @@ mod postgres_tests {
                 None,
                 &author.public_key().to_bytes(),
                 None,
-                None,
             )
             .await
             .expect("create channel");
@@ -1921,7 +1908,6 @@ mod postgres_tests {
                 ChannelVisibility::Open,
                 None,
                 &owner.public_key().to_bytes(),
-                None,
                 None,
             )
             .await

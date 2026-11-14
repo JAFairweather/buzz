@@ -714,6 +714,7 @@ async fn private_media_revocation_http_journey() {
             true,
             &member.public_key().to_hex(),
             None,
+            None,
         )
         .await;
     assert!(

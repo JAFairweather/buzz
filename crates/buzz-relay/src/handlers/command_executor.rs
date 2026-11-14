@@ -1106,7 +1106,7 @@ mod approval_authority_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn approval_authority_rechecks_membership_and_requester_in_the_database() {
-        let state = crate::workflow_sink::integration_tests::test_state().await;
+        let state = crate::workflow_sink::postgres_tests::test_state().await;
         let owner = nostr::Keys::generate();
         let approver = nostr::Keys::generate();
         let outsider = nostr::Keys::generate();
@@ -1197,14 +1197,22 @@ mod approval_authority_tests {
             })
             .await
             .expect("create approval");
-        let approval = state.db.get_approval(community, &token).await.expect("read approval");
+        let approval = state
+            .db
+            .get_approval(community, &token)
+            .await
+            .expect("read approval");
 
-        assert!(authorize_approval_actor(&tenant, &state, &approval, &approver_bytes)
-            .await
-            .is_ok());
-        assert!(authorize_approval_actor(&tenant, &state, &approval, &owner_bytes)
-            .await
-            .is_err());
+        assert!(
+            authorize_approval_actor(&tenant, &state, &approval, &approver_bytes)
+                .await
+                .is_ok()
+        );
+        assert!(
+            authorize_approval_actor(&tenant, &state, &approval, &owner_bytes)
+                .await
+                .is_err()
+        );
         assert!(authorize_approval_actor(
             &tenant,
             &state,
@@ -1218,9 +1226,11 @@ mod approval_authority_tests {
             .remove_member(community, channel.id, &approver_bytes, &owner_bytes)
             .await
             .expect("remove approver");
-        assert!(authorize_approval_actor(&tenant, &state, &approval, &approver_bytes)
-            .await
-            .is_err());
+        assert!(
+            authorize_approval_actor(&tenant, &state, &approval, &approver_bytes)
+                .await
+                .is_err()
+        );
     }
 }
 
@@ -1235,9 +1245,9 @@ async fn authorize_approval_actor(
         .get_workflow(tenant.community(), approval.workflow_id)
         .await
         .map_err(|_| IngestError::Rejected("invalid: approval workflow not found".into()))?;
-    let channel = workflow.channel_id.ok_or_else(|| {
-        IngestError::Rejected("invalid: approval workflow has no channel".into())
-    })?;
+    let channel = workflow
+        .channel_id
+        .ok_or_else(|| IngestError::Rejected("invalid: approval workflow has no channel".into()))?;
     // A fresh DB read is required: a removed member must lose approval authority
     // immediately, even if a relay membership cache still holds the old value.
     let member = state

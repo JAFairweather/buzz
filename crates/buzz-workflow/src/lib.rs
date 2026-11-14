@@ -24,7 +24,7 @@
 //! // The community is the event's server-resolved tenant, threaded from the
 //! // relay's bound `TenantContext` — the same workflow UUID can exist in two
 //! // communities, so execution is always scoped to its owner.
-//! engine.on_event(community_id, &stored_event, &authenticated_author).await?;
+//! engine.on_event_with_author(community_id, &stored_event, &authenticated_author).await?;
 //!
 //! // Run the background scheduler (cron triggers).
 //! tokio::spawn(async move { engine.run().await });
