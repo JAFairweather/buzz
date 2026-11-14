@@ -1074,7 +1074,7 @@ fn check_approver_spec(
 
 #[cfg(test)]
 mod approval_authority_tests {
-    use super::{authorize_approval_actor, check_approver_spec};
+    use super::check_approver_spec;
     const REQUESTER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const APPROVER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
