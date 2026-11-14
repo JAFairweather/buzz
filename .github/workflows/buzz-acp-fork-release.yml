@@ -1,0 +1,73 @@
+# buzz-acp fork release: builds buzz-acp for herd-cloud from one merged main commit and publishes it, with its
+# SHA-256, as a GitHub release tagged with that commit. herd-infra's install-buzz-agents --buzz-acp-release
+# installs it only when the digest matches one supplied separately at install time (Hive
+# buzz-acp-fork-release-deploy-route, My Dude, 14 Nov). Run by hand; it never overwrites an existing release.
+name: buzz-acp fork release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-hex SHA of a commit on main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: buzz-acp-fork-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish buzz-acp (x86_64 musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      COMMIT: ${{ inputs.commit }}
+      TARGET: x86_64-unknown-linux-musl
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check the commit input
+        run: |
+          if ! printf '%s' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::commit must be a full 40-hex SHA"; exit 1
+          fi
+          echo "TAG=buzz-acp-$COMMIT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a commit on main, and no existing release for it
+        run: |
+          git cat-file -e "$COMMIT^{commit}" || { echo "::error::$COMMIT is not in this repository"; exit 1; }
+          git merge-base --is-ancestor "$COMMIT" origin/main || { echo "::error::$COMMIT is not on main"; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists; a release is never replaced"; exit 1
+          fi
+          git checkout --detach "$COMMIT"
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Install cross
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
+        with:
+          tool: cross@0.2.5
+      - name: Build buzz-acp
+        run: cross build --release --locked --target "$TARGET" -p buzz-acp
+      - name: Stage the binary and its digest
+        run: |
+          mkdir -p out
+          cp "target/$TARGET/release/buzz-acp" "out/buzz-acp-$TARGET"
+          file "out/buzz-acp-$TARGET" | grep -q 'statically linked' || { echo "::error::buzz-acp is not statically linked"; exit 1; }
+          (cd out && sha256sum "buzz-acp-$TARGET" > "buzz-acp-$TARGET.sha256")
+          cat "out/buzz-acp-$TARGET.sha256"
+      - name: Publish the release
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$COMMIT" \
+            --title "buzz-acp at ${COMMIT:0:12}" \
+            --notes "buzz-acp ($TARGET), built from $COMMIT on main by run $GITHUB_RUN_ID. Install only with herd-infra install-buzz-agents --buzz-acp-release and a digest checked separately." \
+            "out/buzz-acp-$TARGET" "out/buzz-acp-$TARGET.sha256"
