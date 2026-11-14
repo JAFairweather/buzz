@@ -1115,8 +1115,13 @@ mod approval_authority_tests {
         let host = format!("approval-auth-{}.example", Uuid::new_v4().simple());
         let community = match state
             .db
-            .create_community_with_owner(&host, &owner.public_key().to_hex())
+            .create_community_with_owner(
+                &host,
+                &owner.public_key().to_hex(),
+                &nostr::Keys::generate(),
+            )
             .await
+            .map(|write| write.outcome)
             .expect("create community")
         {
             CreateCommunityWithOwnerResult::Created(rec) => rec.id,
@@ -1167,7 +1172,13 @@ mod approval_authority_tests {
         let context = serde_json::json!({"author": owner.public_key().to_hex()});
         let run_id = state
             .db
-            .create_workflow_run(community, workflow_id, None, Some(&context))
+            .create_workflow_run(
+                community,
+                workflow_id,
+                None,
+                Some(&context),
+                &buzz_db::workflow::RunCause::Event(owner_bytes.to_vec()),
+            )
             .await
             .expect("create run");
         state

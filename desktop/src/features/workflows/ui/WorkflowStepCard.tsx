@@ -98,7 +98,8 @@ function BackendSupportHint({ action }: { action: StepFormState["action"] }) {
       return (
         <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-700">
           Approval requests pause the run. The approver responds with the CLI
-          command in the channel notice; the desktop approval card is not wired yet.
+          command in the channel notice; the desktop approval card is not wired
+          yet.
         </p>
       );
     default:
