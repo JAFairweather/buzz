@@ -1,4 +1,4 @@
-use nostr::{Event, EventBuilder, Keys, RelayUrl, Tag};
+use nostr::{Event, EventBuilder, NostrSigner, RelayUrl, Tag};
 use serde_json::Value;
 
 use crate::error::WsClientError;
@@ -36,6 +36,13 @@ pub enum RelayMessage {
     Auth {
         /// The challenge string to sign.
         challenge: String,
+    },
+    /// A NIP-45 COUNT response.
+    Count {
+        /// The subscription ID this count belongs to.
+        subscription_id: String,
+        /// The number of matching events.
+        count: u64,
     },
 }
 
@@ -137,21 +144,37 @@ pub fn parse_relay_message(text: &str) -> Result<RelayMessage, WsClientError> {
                 .to_string();
             Ok(RelayMessage::Auth { challenge })
         }
+        "COUNT" => {
+            let sub_id = arr
+                .get(1)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| WsClientError::UnexpectedMessage(text.to_string()))?
+                .to_string();
+            let count = arr
+                .get(2)
+                .and_then(|o| o.get("count"))
+                .and_then(|c| c.as_u64())
+                .ok_or_else(|| WsClientError::UnexpectedMessage(text.to_string()))?;
+            Ok(RelayMessage::Count {
+                subscription_id: sub_id,
+                count,
+            })
+        }
         other => Err(WsClientError::UnexpectedMessage(format!(
             "unknown message type: {other}"
         ))),
     }
 }
 
-/// Builds a NIP-42 AUTH event, optionally injecting a NIP-OA auth tag.
+/// Builds a NIP-42 AUTH event signed by `signer`, optionally injecting a NIP-OA auth tag.
 ///
 /// The `auth_tag` parameter allows callers to attach a workspace-scoped
 /// authorization tag (e.g. `["auth", "<token>"]`) alongside the standard
 /// relay and challenge tags required by NIP-42.
-pub fn build_auth_event(
+pub async fn build_auth_event<S: NostrSigner>(
     challenge: &str,
     relay_url: &str,
-    keys: &Keys,
+    signer: &S,
     auth_tag: Option<&Tag>,
 ) -> Result<Event, WsClientError> {
     let url = RelayUrl::parse(relay_url).map_err(|e| WsClientError::Url(e.to_string()))?;
@@ -162,6 +185,7 @@ pub fn build_auth_event(
         builder
     };
     builder
-        .sign_with_keys(keys)
+        .sign(signer)
+        .await
         .map_err(|e| WsClientError::EventBuilder(e.to_string()))
 }

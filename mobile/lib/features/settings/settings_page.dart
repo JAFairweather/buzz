@@ -1,323 +1,342 @@
+import 'package:buzz/shared/widgets/feedback_snackbar.dart';
+import 'package:buzz/shared/widgets/adaptive_conversation_pane.dart';
+
+import 'dart:async';
+
+import 'package:buzz/shared/crypto/event_signing.dart';
+import 'package:flutter/foundation.dart';
+import 'package:duo_kit/duo_kit.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 import 'package:nostr/nostr.dart' as nostr;
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../../shared/auth/auth.dart';
+import '../../shared/identity_transfer/nsec_export_sheet.dart';
 import '../../shared/clipboard_utils.dart';
+import '../../shared/hosted/hosted_environment.dart';
+import '../../shared/hosted/organization_environment.dart';
+import '../../shared/hosted/organization_sign_out.dart';
+import '../../shared/push/push_relay_capability_provider.dart';
+import '../../shared/push/push_bootstrap.dart';
 import '../../shared/relay/relay.dart';
+import '../../shared/utils/string_utils.dart';
+import '../pairing/pairing_provider.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/app_list.dart';
+import '../../shared/widgets/app_list_card.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
-import '../profile/set_status_sheet.dart';
-import '../profile/user_status_provider.dart';
-import '../custom_emoji/custom_emoji_provider.dart';
-import '../custom_emoji/custom_emoji_render.dart';
-import 'theme_picker_page.dart';
+import '../../shared/widgets/duo_toolbar.dart';
+import '../../shared/widgets/bottom_up_page_route.dart';
+import '../../shared/widgets/ios_glass_navigation_button.dart';
+import '../../shared/widgets/immediate_page_route.dart';
+
+part 'settings_page/profile_section.dart';
+part 'settings_page/status_section.dart';
+part 'settings_page/connection_section.dart';
+part 'settings_page/notifications_section.dart';
+part 'settings_page/builderlab_account_section.dart';
+
+Widget _emptyProfileEditPage(BuildContext context) => const SizedBox.shrink();
 
 class SettingsPage extends HookConsumerWidget {
-  const SettingsPage({super.key});
+  /// Creates the settings page.
+  const SettingsPage({
+    super.key,
+    required this.profileHeader,
+    required this.identityRecoveryPageBuilder,
+    this.profileEditPageBuilder = _emptyProfileEditPage,
+    this.onSetStatus,
+    this.onEditDisplayName,
+    this.onEditProfileDescription,
+  });
+
+  /// Header widget displayed at the top of settings.
+  final Widget profileHeader;
+
+  /// Builds the identity-recovery page pushed from the recovery settings row.
+  final WidgetBuilder identityRecoveryPageBuilder;
+
+  /// Builds the current-user profile editor opened from the Photo row.
+  final WidgetBuilder profileEditPageBuilder;
+
+  /// Opens the current-user status editor.
+  final void Function(BuildContext context)? onSetStatus;
+
+  /// Opens the display-name editor from the settings section.
+  final Future<void> Function(BuildContext context)? onEditDisplayName;
+
+  /// Opens the profile-description editor from the settings section.
+  final Future<void> Function(BuildContext context)? onEditProfileDescription;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final config = ref.watch(relayConfigProvider);
-    final selectedAccent = ref.watch(accentProvider);
-    final selectedScheme = ref.watch(schemeProvider);
-    final colorScheme = context.colors;
     final packageInfoFuture = useMemoized(() => PackageInfo.fromPlatform());
     final packageInfo = useFuture(packageInfoFuture);
+    final strip = FoldGeometry.of(context).strip;
+    final avatarFirst =
+        defaultTargetPlatform == TargetPlatform.iOS && strip != null;
+    final topSectionHeight = avatarFirst
+        ? (usesConversationPanes(context, strip: strip) ? 0.0 : Grid.sm)
+        : frostedAppBarHeight(context, bottomHeight: Grid.xxs);
 
-    return FrostedScaffold(
-      appBar: const FrostedAppBar(title: Text('Settings')),
-      body: Column(
-        children: [
-          Expanded(
-            child: ListView(
-              padding: EdgeInsets.only(
-                top: frostedAppBarHeight(context),
-                bottom: Grid.xs,
-              ),
-              children: [
-                const SizedBox(height: Grid.xxs),
+    final wide = usesConversationPanes(context, strip: strip);
 
-                // Status — flush header row, like Slack's profile/status block.
-                _StatusRow(),
-
-                // Appearance
-                AppListSection(
-                  label: 'Appearance',
-                  children: [
-                    AppListRow(
-                      icon: LucideIcons.palette,
-                      title: 'Color Scheme',
-                      subtitle: selectedScheme == null
-                          ? 'Default ($defaultSchemeDisplayName)'
-                          : findTheme(selectedScheme)?.displayName ??
-                                selectedScheme,
-                      trailing: Icon(
-                        LucideIcons.chevronRight,
-                        size: 18,
-                        color: context.colors.onSurfaceVariant,
-                      ),
-                      onTap: () => Navigator.of(context).push(
-                        MaterialPageRoute<void>(
-                          builder: (_) => const ThemePickerPage(),
-                        ),
-                      ),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(
-                        Grid.gutter,
-                        Grid.xxs,
-                        Grid.gutter,
-                        Grid.twelve,
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Accent Color',
-                            style: context.textTheme.bodyMedium?.copyWith(
-                              color: context.colors.onSurfaceVariant,
-                            ),
-                          ),
-                          const SizedBox(height: Grid.twelve),
-                          Wrap(
-                            spacing: Grid.xxs,
-                            runSpacing: Grid.xxs,
-                            children: [
-                              for (var i = 0; i < accentColors.length; i++)
-                                _AccentSwatch(
-                                  color: accentColorForScheme(colorScheme, i),
-                                  label: accentColors[i].name,
-                                  selected: selectedAccent == i,
-                                  onTap: () => ref
-                                      .read(accentProvider.notifier)
-                                      .setAccent(i),
-                                ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
+    final sections = <(String, Widget)>[
+      ('Status', _StatusSection(onSetStatus: onSetStatus)),
+      (
+        'Profile',
+        _ProfileSection(
+          profileEditPageBuilder: profileEditPageBuilder,
+          onEditDisplayName: onEditDisplayName,
+          onEditProfileDescription: onEditProfileDescription,
+        ),
+      ),
+      if (_notificationsVisible(ref))
+        ('Notifications', const _NotificationsSection()),
+      (
+        'Connection',
+        _ConnectionSection(
+          identityRecoveryPageBuilder: identityRecoveryPageBuilder,
+        ),
+      ),
+      if (HostedEnvironment.enabled)
+        ('Account', const _BuilderlabAccountSection()),
+    ];
+    Widget detail(String name, Widget section) => Builder(
+      builder: (detailContext) => FrostedScaffold(
+        useUtilitySurfaceTheme: true,
+        appBar: FrostedAppBar(
+          nativeTitle: name,
+          title: Text(name),
+          automaticallyImplyLeading: !usesConversationPanes(
+            detailContext,
+            windowSize:
+                View.of(detailContext).physicalSize /
+                View.of(detailContext).devicePixelRatio,
+          ),
+        ),
+        body: ListView(
+          padding: EdgeInsets.only(
+            top: frostedAppBarHeight(detailContext),
+            bottom: MediaQuery.paddingOf(detailContext).bottom + Grid.xs,
+          ),
+          children: [section],
+        ),
+      ),
+    );
+    final controller = useMemoized(ConversationPaneController.new);
+    useEffect(() => controller.dispose, [controller]);
+    useEffect(
+      () {
+        if (wide &&
+            (controller.selectedId == null ||
+                (controller.selectedId == 'Notifications' &&
+                    !sections.any(
+                      (section) => section.$1 == 'Notifications',
+                    )))) {
+          final section = sections.first;
+          controller.open(
+            section.$1,
+            (_) => detail(section.$1, section.$2),
+            animate: false,
+          );
+        }
+        return null;
+      },
+      [
+        wide,
+        controller.selectedId,
+        sections.map((section) => section.$1).join(','),
+      ],
+    );
+    useListenable(controller);
+    // Keep feedback local even while Home is mounted during the transition.
+    return Theme(
+      data: utilitySurfaceThemeData(Theme.of(context)),
+      child: AdaptiveConversationDestination(
+        preferredListWidth: avatarFirst ? 375 : null,
+        emptyLabel: 'Select a setting',
+        listToolbarSlots: 1,
+        controller: controller,
+        persistentSelection: sections.any(
+          (section) => section.$1 == controller.selectedId,
+        ),
+        child: Builder(
+          builder: (paneContext) => ScaffoldMessenger(
+            child: FrostedScaffold(
+              useUtilitySurfaceTheme: true,
+              appBar: FrostedAppBar(
+                nativeTitle: avatarFirst ? '' : 'Settings',
+                railOnly: avatarFirst,
+                nativeLeading: IosNavigationAction(
+                  label: 'Close settings',
+                  symbol: 'xmark',
+                  onPressed: () => Navigator.of(context).pop(),
                 ),
-
-                // Connection
-                AppListSection(
-                  label: 'Connection',
-                  children: [
-                    AppListRow(
-                      icon: LucideIcons.server,
-                      title: 'Connected to',
-                      subtitle: config.baseUrl,
-                    ),
-                    if (config.nsec != null && config.nsec!.isNotEmpty)
-                      Builder(
-                        builder: (context) {
-                          final privHex = nostr.Nip19.decode(
-                            payload: config.nsec!,
-                          ).data;
-                          final pubkey = privHex.isNotEmpty
-                              ? nostr.Keys(privHex).public
-                              : 'unknown';
-                          return AppListRow(
-                            icon: LucideIcons.key,
-                            title: 'Identity (pubkey)',
-                            subtitle: pubkey,
-                            subtitleStyle: context.textTheme.bodySmall
-                                ?.copyWith(
-                                  color: context.colors.onSurfaceVariant,
-                                  fontFamily: 'GeistMono',
-                                  fontSize: 11,
-                                ),
-                            subtitleMaxLines: 2,
-                            trailing: IconButton(
-                              icon: const Icon(LucideIcons.copy, size: 16),
-                              onPressed: () async {
-                                await copyToClipboard(
-                                  context,
-                                  pubkey,
-                                  message: 'Pubkey copied',
-                                );
-                              },
-                            ),
-                          );
+                automaticallyImplyLeading: false,
+                horizontalInset: Grid.gutter,
+                leading: Theme.of(context).platform == TargetPlatform.iOS
+                    ? IosGlassNavigationButton(
+                        key: const ValueKey('settings-ios-glass-close'),
+                        icon: IosGlassNavigationIcon.close,
+                        semanticLabel: 'Close settings',
+                        onPressed: () {
+                          unawaited(HapticFeedback.lightImpact());
+                          Navigator.of(context).pop();
                         },
-                      ),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: Grid.xxs),
-                      child: Center(
-                        child: TextButton.icon(
-                          onPressed: () => _confirmSignOut(context, ref),
-                          icon: const Icon(LucideIcons.logOut, size: 18),
-                          label: const Text('Remove Community'),
-                          style: TextButton.styleFrom(
-                            foregroundColor: context.colors.error,
-                          ),
+                        foregroundColor: navigationPrimaryForeground(context),
+                      )
+                    : SizedBox(
+                        width: Grid.xl,
+                        height: Grid.xl,
+                        child: IconButton(
+                          tooltip: 'Close settings',
+                          onPressed: () {
+                            unawaited(HapticFeedback.lightImpact());
+                            Navigator.of(context).pop();
+                          },
+                          color: navigationPrimaryForeground(context),
+                          icon: const Icon(BuzzIcons.x),
                         ),
                       ),
+                bottomHeight: Grid.xxs,
+                bottom: const SizedBox.expand(),
+              ),
+              body: ListView(
+                padding: EdgeInsets.only(
+                  top: topSectionHeight,
+                  bottom: MediaQuery.paddingOf(context).bottom + Grid.xs,
+                ),
+                children: [
+                  profileHeader,
+                  if (wide)
+                    AppListCard(
+                      dividerIndent: Grid.xs,
+                      verticalPadding: Grid.twelve,
+                      children: [
+                        for (final section in sections)
+                          AppListRow(
+                            title: section.$1,
+                            trailing: const _RowChevron(),
+                            onTap: () => controller.open(
+                              section.$1,
+                              (_) => detail(section.$1, section.$2),
+                              animate: false,
+                            ),
+                          ),
+                      ],
+                    )
+                  else ...[
+                    _StatusSection(onSetStatus: onSetStatus),
+                    _ProfileSection(
+                      profileEditPageBuilder: profileEditPageBuilder,
+                      onEditDisplayName: onEditDisplayName,
+                      onEditProfileDescription: onEditProfileDescription,
+                    ),
+                    const _NotificationsSection(),
+                    _ConnectionSection(
+                      identityRecoveryPageBuilder: identityRecoveryPageBuilder,
                     ),
                   ],
-                ),
-              ],
+                  if (!wide && HostedEnvironment.enabled)
+                    const _BuilderlabAccountSection(),
+                  // An internal build's only way out of its organization, rarely
+                  // needed, so it sits last.
+                  if (OrganizationEnvironment.enabled)
+                    AppListCard(
+                      verticalPadding: Grid.twelve,
+                      children: [
+                        AppListRow(
+                          key: const Key('settings-sign-out'),
+                          icon: BuzzIcons.logOut,
+                          title: 'Sign out',
+                          titleColor: context.colors.error,
+                          onTap: () => confirmOrganizationSignOut(context, ref),
+                        ),
+                      ],
+                    ),
+                  if (packageInfo.hasData)
+                    _VersionFooter(
+                      version: packageInfo.data!.version,
+                      buildNumber: packageInfo.data!.buildNumber,
+                    ),
+                ],
+              ),
             ),
           ),
-          if (packageInfo.hasData)
-            SafeArea(
-              top: false,
+        ),
+      ),
+    );
+  }
+}
+
+class _VersionFooter extends StatelessWidget {
+  const _VersionFooter({required this.version, required this.buildNumber});
+
+  final String version;
+  final String buildNumber;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = buildNumber.isEmpty
+        ? 'v$version'
+        : 'v$version ($buildNumber)';
+    return SafeArea(
+      top: false,
+      child: Center(
+        child: Semantics(
+          button: true,
+          onTapHint: 'Copy version',
+          child: InkWell(
+            borderRadius: BorderRadius.circular(Grid.xs),
+            onTap: () =>
+                copyToClipboard(context, label, message: 'Version copied'),
+            // Keep the text where it was and grow the tap target downward
+            // to the platform minimum.
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(
+                minHeight: kMinInteractiveDimension,
+              ),
               child: Padding(
-                padding: const EdgeInsets.only(bottom: Grid.xs, top: Grid.xxs),
-                child: Center(
-                  child: Text(
-                    'v${packageInfo.data!.version}',
-                    style: context.textTheme.bodySmall?.copyWith(
-                      color: context.colors.onSurfaceVariant.withValues(
-                        alpha: 0.6,
-                      ),
+                padding: const EdgeInsets.fromLTRB(
+                  Grid.xs,
+                  Grid.xxs,
+                  Grid.xs,
+                  Grid.xs,
+                ),
+                child: Text(
+                  label,
+                  style: context.textTheme.bodySmall?.copyWith(
+                    color: context.colors.onSurfaceVariant.withValues(
+                      alpha: 0.6,
                     ),
                   ),
                 ),
               ),
             ),
-        ],
-      ),
-    );
-  }
-
-  void _confirmSignOut(BuildContext context, WidgetRef ref) {
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Remove Community'),
-        content: const Text(
-          'This will disconnect this community. You will need '
-          'to scan a new pairing code to reconnect.',
+          ),
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () {
-              Navigator.of(ctx).pop(); // close dialog
-              // Pop all pushed routes back to root so MaterialApp.home
-              // rebuilds to PairingPage when auth state changes.
-              Navigator.of(context).popUntil((route) => route.isFirst);
-              ref.read(authProvider.notifier).signOut();
-            },
-            style: FilledButton.styleFrom(backgroundColor: ctx.colors.error),
-            child: const Text('Remove'),
-          ),
-        ],
       ),
     );
   }
 }
 
-class _StatusRow extends ConsumerWidget {
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final statusAsync = ref.watch(userStatusProvider);
-    final status = statusAsync.asData?.value;
-    final hasStatus = status != null && !status.isEmpty;
-
-    return AppListRowRaw(
-      leading: _StatusEmojiIcon(emoji: status?.emoji ?? ''),
-      title: Text(
-        hasStatus
-            ? (status.text.isNotEmpty ? status.text : status.emoji)
-            : 'Set a status',
-        style: hasStatus
-            ? context.textTheme.bodyLarge
-            : context.textTheme.bodyLarge?.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-      ),
-      subtitle: hasStatus
-          ? Text(
-              'Tap to update',
-              style: context.textTheme.bodySmall?.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-            )
-          : null,
-      onTap: () => showSetStatusSheet(context, currentStatus: status),
-    );
-  }
-}
-
-class _StatusEmojiIcon extends ConsumerWidget {
-  final String emoji;
-
-  const _StatusEmojiIcon({required this.emoji});
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    if (emoji.isEmpty) {
-      return const Text('\u{1F4AC}', style: TextStyle(fontSize: 20));
-    }
-    final shortcode = emoji.startsWith(':') && emoji.endsWith(':')
-        ? emoji.substring(1, emoji.length - 1).toLowerCase()
-        : null;
-    if (shortcode != null) {
-      for (final entry in ref.watch(customEmojiListProvider)) {
-        if (entry.shortcode == shortcode) {
-          return CustomEmojiImage(
-            shortcode: shortcode,
-            url: entry.url,
-            size: 24,
-          );
-        }
-      }
-    }
-    return Text(emoji, style: const TextStyle(fontSize: 20));
-  }
-}
-
-class _AccentSwatch extends StatelessWidget {
-  const _AccentSwatch({
-    required this.color,
-    required this.label,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final Color color;
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
+/// Trailing affordance shared by the rows that push a picker page.
+class _RowChevron extends StatelessWidget {
+  const _RowChevron();
 
   @override
   Widget build(BuildContext context) {
-    return Tooltip(
-      message: label,
-      child: GestureDetector(
-        onTap: onTap,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 150),
-          width: 36,
-          height: 36,
-          decoration: BoxDecoration(
-            color: color,
-            borderRadius: BorderRadius.circular(Radii.md),
-            border: selected
-                ? Border.all(color: context.colors.onSurface, width: 2.5)
-                : Border.all(color: color.withValues(alpha: 0.4), width: 1),
-          ),
-          child: selected
-              ? Icon(
-                  LucideIcons.check,
-                  size: 16,
-                  color: contrastForeground(color),
-                )
-              : null,
-        ),
-      ),
+    return Icon(
+      BuzzIcons.chevronRight,
+      size: 18,
+      color: context.colors.onSurfaceVariant,
     );
   }
 }

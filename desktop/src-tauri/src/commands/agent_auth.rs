@@ -194,6 +194,7 @@ fn run_buzz_acp_auth_command_with_paths<const N: usize>(
     if let Some(path) = augmented_path {
         command.env("PATH", path);
     }
+    crate::util::configure_no_window(&mut command);
 
     command
         .output()
@@ -226,13 +227,16 @@ fn run_claude_subscription_login(runtime_id: &str, method: &AcpAuthMethod) -> Re
     let (command, args) = argv
         .split_first()
         .ok_or_else(|| "Claude login command is empty".to_string())?;
-    let status = Command::new(command)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| format!("failed to run Claude login: {error}"))?;
+    let status = {
+        let mut cmd = Command::new(command);
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::util::configure_no_window(&mut cmd);
+        cmd.status()
+            .map_err(|error| format!("failed to run Claude login: {error}"))?
+    };
     if !status.success() {
         return Err(format!(
             "Claude login failed (exit {})",
@@ -498,6 +502,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn auth_command_uses_augmented_path_for_node_adapter() {
+        let _nest = crate::managed_agents::pin_temp_nest_dir_for_thread();
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
