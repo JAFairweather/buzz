@@ -66,7 +66,14 @@ jobs:
         run: |
           mkdir -p out
           cp "target/$TARGET/release/buzz-acp" "out/buzz-acp-$TARGET"
-          file "out/buzz-acp-$TARGET" | grep -q 'statically linked' || { echo "::error::buzz-acp is not statically linked"; exit 1; }
+          # Static means no program interpreter and no shared-library dependency. musl Rust builds are static-pie,
+          # which file(1) reports as "static-pie linked", not "statically linked", so the ELF headers decide.
+          bin="out/buzz-acp-$TARGET"
+          file "$bin"
+          readelf -hW "$bin" | grep -q 'Machine:[[:space:]]*Advanced Micro Devices X86-64' || { echo "::error::buzz-acp is not an x86-64 ELF"; exit 1; }
+          if readelf -lW "$bin" | grep -q 'INTERP' || readelf -dW "$bin" | grep -q '(NEEDED)'; then
+            echo "::error::buzz-acp is not statically linked"; exit 1
+          fi
           (cd out && sha256sum "buzz-acp-$TARGET" > "buzz-acp-$TARGET.sha256")
           cat "out/buzz-acp-$TARGET.sha256"
       - name: Pin the tag to this commit before publishing
