@@ -1291,6 +1291,7 @@ pub(crate) mod postgres_tests {
         let owner_notice = load_event(&owner_notice_id).await;
         assert!(
             owner_notice
+                .event
                 .tags
                 .iter()
                 .any(|tag| tag.as_slice() == ["p", author_hex.as_str()]),
