@@ -2725,6 +2725,11 @@ impl Db {
         .await
     }
 
+    /// Expire overdue workflow approvals and fail their waiting runs.
+    pub async fn expire_pending_approvals(&self) -> Result<u64> {
+        workflow::expire_pending_approvals(&self.pool).await
+    }
+
     /// Create an approval request.
     pub async fn create_approval(&self, params: workflow::CreateApprovalParams<'_>) -> Result<()> {
         workflow::create_approval(&self.pool, params).await

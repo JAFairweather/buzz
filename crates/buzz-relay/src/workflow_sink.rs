@@ -583,7 +583,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod integration_tests {
+pub(crate) mod integration_tests {
     //! Regression test for `e3661764` / `7899c1a8`: a workflow `send_message`
     //! that mentions a channel member by name (`@Name`) must emit a `p` tag for
     //! that member so ACP agent wake (`event_mentions_agent`, p-tag gated) fires.
@@ -596,7 +596,7 @@ mod integration_tests {
     use std::sync::Arc;
 
     /// Real-PG state mirroring `handlers::event::tests::test_state_with_redis_url`.
-    async fn test_state() -> Arc<AppState> {
+    pub(crate) async fn test_state() -> Arc<AppState> {
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();

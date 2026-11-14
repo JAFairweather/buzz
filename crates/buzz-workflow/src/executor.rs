@@ -441,7 +441,9 @@ pub fn resolve_step_templates(
             message,
             timeout,
         } => Ok(RequestApproval {
-            from: t(from)?,
+            // Approval authority is fixed by the stored workflow definition.
+            // Trigger and webhook fields may shape the prompt, never the approver.
+            from: from.clone(),
             message: t(message)?,
             timeout: timeout.clone(),
         }),
@@ -460,8 +462,6 @@ pub enum StepResult {
     Suspended {
         /// Token used to resume or reject this approval gate.
         approval_token: String,
-        /// Resolved approver identity.
-        from: String,
         /// Resolved prompt shown to the approver.
         message: String,
         /// Approval lifetime.
@@ -668,7 +668,6 @@ pub async fn dispatch_action(
 
             Ok(StepResult::Suspended {
                 approval_token: token,
-                from: from.clone(),
                 message: message.clone(),
                 timeout: timeout_str.to_owned(),
             })
@@ -959,8 +958,6 @@ pub struct ExecutionResult {
 pub struct PendingApproval {
     /// Random token presented to the designated approver.
     pub token: String,
-    /// Exact pubkey or `any`.
-    pub from: String,
     /// Prompt shown to the approver.
     pub message: String,
     /// Approval lifetime.
@@ -1201,7 +1198,6 @@ async fn execute_steps(
             }
             StepResult::Suspended {
                 approval_token,
-                from,
                 message,
                 timeout,
             } => {
@@ -1214,7 +1210,6 @@ async fn execute_steps(
                 return Ok(ExecutionResult {
                     pending_approval: Some(PendingApproval {
                         token: approval_token,
-                        from,
                         message,
                         timeout,
                     }),
