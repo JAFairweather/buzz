@@ -370,9 +370,11 @@ impl ActionSink for RelayActionSink {
                 // The owner attribution tag is marked `owner` and does not
                 // notify. An approval addressed to the workflow owner still
                 // needs a separate plain p tag to reach its approver.
-                tags.push(Tag::parse(["p", &recipient.to_hex()]).map_err(|e| {
-                    ActionSinkError::EventBuild(format!("recipient p tag: {e}"))
-                })?);
+                tags.push(
+                    Tag::parse(["p", &recipient.to_hex()]).map_err(|e| {
+                        ActionSinkError::EventBuild(format!("recipient p tag: {e}"))
+                    })?,
+                );
             }
 
             // Resolve thread ancestry when this is a threaded reply, so the
