@@ -230,30 +230,6 @@ fn approval_reference_hash(reference: &str) -> Result<String, CliError> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::approval_reference_hash;
-    use sha2::Digest;
-
-    #[test]
-    fn approval_request_hash_is_not_rehashed() {
-        let hash = "ABCDEF0123456789".repeat(4);
-        assert_eq!(
-            approval_reference_hash(&hash).unwrap(),
-            hash.to_ascii_lowercase()
-        );
-    }
-
-    #[test]
-    fn raw_approval_uuid_is_hashed_once() {
-        let token = "00000000-0000-0000-0000-000000000000";
-        assert_eq!(
-            approval_reference_hash(token).unwrap(),
-            hex::encode(sha2::Sha256::digest(token.as_bytes())),
-        );
-    }
-}
-
 pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(), CliError> {
     use crate::WorkflowsCmd;
     match cmd {
@@ -282,5 +258,29 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             // approved is already a bool — no parse_bool_flag needed
             cmd_approve_step(client, &token, approved, note.as_deref()).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approval_reference_hash;
+    use sha2::Digest;
+
+    #[test]
+    fn approval_request_hash_is_not_rehashed() {
+        let hash = "ABCDEF0123456789".repeat(4);
+        assert_eq!(
+            approval_reference_hash(&hash).unwrap(),
+            hash.to_ascii_lowercase()
+        );
+    }
+
+    #[test]
+    fn raw_approval_uuid_is_hashed_once() {
+        let token = "00000000-0000-0000-0000-000000000000";
+        assert_eq!(
+            approval_reference_hash(token).unwrap(),
+            hex::encode(sha2::Sha256::digest(token.as_bytes())),
+        );
     }
 }

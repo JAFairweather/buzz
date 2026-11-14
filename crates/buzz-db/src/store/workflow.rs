@@ -2766,9 +2766,16 @@ mod postgres_tests {
         let pool = setup_pool().await;
         let community = make_community(&pool).await;
         let (workflow_id, _) = make_workflow_in(&pool, community).await;
-        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
-            .await
-            .expect("create run");
+        let run_id = create_workflow_run(
+            &pool,
+            community,
+            workflow_id,
+            None,
+            None,
+            &RunCause::Schedule,
+        )
+        .await
+        .expect("create run");
         update_workflow_run(
             &pool,
             community,
