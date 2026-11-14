@@ -191,6 +191,14 @@ impl WorkflowDef {
                 )));
             }
             if let ActionDef::RequestApproval { from, .. } = &step.action {
+                if !matches!(
+                    &self.trigger,
+                    TriggerDef::MessagePosted { .. } | TriggerDef::ReactionAdded { .. }
+                ) {
+                    return Err(WorkflowError::InvalidDefinition(
+                        "approval requires a message_posted or reaction_added trigger with an authenticated requester".into(),
+                    ));
+                }
                 let exact = from.len() == 64 && from.chars().all(|c| c.is_ascii_hexdigit());
                 if from != "any" && !exact {
                     return Err(WorkflowError::InvalidDefinition(
@@ -345,7 +353,7 @@ mod tests {
         // Use unquoted or single-quoted YAML values throughout.
         let yaml = concat!(
             "name: All Actions\n",
-            "trigger:\n  on: webhook\n",
+            "trigger:\n  on: message_posted\n",
             "steps:\n",
             "  - id: msg\n    action: send_message\n    text: Hello\n    channel: general\n",
             "  - id: dm\n    action: send_dm\n    to: '{{trigger.author}}'\n    text: You triggered this\n",
@@ -386,7 +394,7 @@ mod tests {
     fn parse_approval_gate_example() {
         let yaml = concat!(
             "name: Deploy Approval\n",
-            "trigger:\n  on: webhook\n",
+            "trigger:\n  on: message_posted\n",
             "steps:\n",
             "  - id: request\n    action: request_approval\n    from: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n",
             "    message: Approve deploy?\n    timeout: 4h\n",
@@ -406,6 +414,20 @@ mod tests {
                 "name: Gate\ntrigger:\n  on: message_posted\nsteps:\n  - id: gate\n    action: request_approval\n    from: '{from}'\n    message: Approve?\n"
             );
             assert!(parse_yaml(&yaml).is_err(), "accepted dynamic approver: {from}");
+        }
+    }
+
+    #[test]
+    fn approval_requires_authenticated_event_trigger() {
+        for trigger in [
+            "on: webhook",
+            "on: schedule\n  interval: 1h",
+            "on: diff_posted",
+        ] {
+            let yaml = format!(
+                "name: Gate\ntrigger:\n  {trigger}\nsteps:\n  - id: gate\n    action: request_approval\n    from: any\n    message: Approve?\n"
+            );
+            assert!(parse_yaml(&yaml).is_err(), "accepted approval for {trigger}");
         }
     }
 
