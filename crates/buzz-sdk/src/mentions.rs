@@ -56,51 +56,19 @@ pub struct MentionProfile<'a> {
 /// available — it correctly handles multi-word display names.
 ///
 /// Returns lowercased names found after `@` tokens. An `@name` only matches
-/// when the `@` is at start-of-string or preceded by an ASCII whitespace
-/// character — this excludes things like email addresses (`user@host`).
+/// when the `@` is at start-of-string or preceded by whitespace, a markdown
+/// formatting delimiter, or an opening punctuation/table delimiter — this
+/// excludes things like email addresses (`user@host`).
 ///
 /// Allowed name characters: ASCII alphanumerics, `.`, `-`, `_`.
 /// Duplicates are removed; first-seen order is preserved.
 pub fn extract_at_names(content: &str) -> Vec<String> {
-    if content.is_empty() || !content.contains('@') {
-        return vec![];
-    }
-    let mut names: Vec<String> = Vec::new();
-    let mut seen = HashSet::new();
-    let chars: Vec<char> = content.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    while i < len {
-        if chars[i] == '@' {
-            let preceded_by_ws = i == 0 || chars[i - 1].is_ascii_whitespace();
-            if preceded_by_ws && i + 1 < len {
-                let start = i + 1;
-                let mut end = start;
-                while end < len {
-                    let c = chars[end];
-                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                        end += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if end > start {
-                    let name: String = chars[start..end].iter().collect();
-                    let lower = name.to_ascii_lowercase();
-                    if seen.insert(lower.clone()) {
-                        names.push(lower);
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    names
+    extract_at_mentions_with_known(content, &[])
 }
 
 /// Extract `@mention` names from message content using known member names.
 ///
-/// At each `@` preceded by whitespace or start-of-string, tries known names
+/// At each `@` preceded by a valid mention boundary, tries known names
 /// longest-first (case-insensitive, word-boundary-checked), then falls back
 /// to single-word tokenization. Returns lowercased names in first-seen order,
 /// deduplicated. Empty/whitespace-only entries in `known_names` are ignored.
@@ -120,8 +88,7 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
     let mut seen = HashSet::new();
 
     for (i, _) in content.match_indices('@') {
-        let preceded = i == 0 || content.as_bytes()[i - 1].is_ascii_whitespace();
-        if !preceded {
+        if !is_mention_prefix_boundary(&content[..i]) {
             continue;
         }
         let rest = &content[i + 1..];
@@ -138,10 +105,11 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
             let end = rest
                 .find(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '-' | '_'))
                 .unwrap_or(rest.len());
-            if end == 0 {
+            let token = rest[..end].trim_end_matches(['.', '_']);
+            if token.is_empty() {
                 continue;
             }
-            rest[..end].to_ascii_lowercase()
+            token.to_ascii_lowercase()
         };
 
         if seen.insert(lower.clone()) {
@@ -151,10 +119,71 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
     names
 }
 
+fn is_prefix_opener(c: char) -> bool {
+    c.is_ascii_whitespace()
+        || matches!(
+            c,
+            '*' | '~' | '|' | '(' | '[' | '{' | '<' | '>' | '"' | '\''
+        )
+}
+
+fn is_mention_prefix_boundary(before: &str) -> bool {
+    let Some(last) = before.chars().next_back() else {
+        return true;
+    };
+    if is_prefix_opener(last) {
+        return true;
+    }
+    if last == '_' {
+        let without_underscores = before.trim_end_matches('_');
+        let underscore_count = before.len() - without_underscores.len();
+        return (1..=3).contains(&underscore_count)
+            && without_underscores
+                .chars()
+                .next_back()
+                .is_none_or(is_prefix_opener);
+    }
+    false
+}
+
+fn is_non_underscore_boundary_char(c: char) -> bool {
+    c.is_ascii_whitespace()
+        || matches!(
+            c,
+            ',' | ';'
+                | '.'
+                | '!'
+                | '?'
+                | ':'
+                | ')'
+                | ']'
+                | '}'
+                | '>'
+                | '"'
+                | '\''
+                | '*'
+                | '~'
+                | '|'
+        )
+}
+
 fn is_word_boundary(s: &str) -> bool {
-    s.chars().next().is_none_or(|c| {
-        c.is_ascii_whitespace() || matches!(c, ',' | ';' | '.' | '!' | '?' | ':' | ')' | ']' | '}')
-    })
+    let Some(first) = s.chars().next() else {
+        return true;
+    };
+    if is_non_underscore_boundary_char(first) {
+        return true;
+    }
+    if first == '_' {
+        let after_underscores = s.trim_start_matches('_');
+        let underscore_count = s.len() - after_underscores.len();
+        return (1..=3).contains(&underscore_count)
+            && after_underscores
+                .chars()
+                .next()
+                .is_none_or(is_non_underscore_boundary_char);
+    }
+    false
 }
 
 /// Match extracted `@names` against channel-member profiles.
@@ -422,8 +451,42 @@ mod tests {
         assert!(extract_at_names("").is_empty());
         assert!(extract_at_names("no mentions").is_empty());
         assert!(extract_at_names("user@example.com").is_empty());
+        assert!(extract_at_names("foo_@bar").is_empty());
         assert!(extract_at_names("hello @ world").is_empty());
         assert!(extract_at_names("hello @").is_empty());
+    }
+
+    #[test]
+    fn extract_at_mentions_matches_markdown_formatting_and_table_cells() {
+        assert_eq!(
+            extract_at_mentions_with_known("| **@Kerouac** |", &["Kerouac"]),
+            vec!["kerouac"]
+        );
+        assert_eq!(
+            extract_at_mentions_with_known("|**@Kerouac**|", &["Kerouac"]),
+            vec!["kerouac"]
+        );
+        assert_eq!(
+            extract_at_mentions_with_known("|@Kerouac|", &["Kerouac"]),
+            vec!["kerouac"]
+        );
+        assert_eq!(
+            extract_at_mentions_with_known(
+                "**@My Dude** and _@Will Pfleger_ and ~~@Alice~~",
+                &["My Dude", "Will Pfleger", "Alice"],
+            ),
+            vec!["my dude", "will pfleger", "alice"]
+        );
+        assert_eq!(
+            extract_at_names("| **@Kerouac** | _@Alice_ __@Bob__ ~~@Carol~~ (@Dave) [@Eve]"),
+            vec!["kerouac", "alice", "bob", "carol", "dave", "eve"]
+        );
+    }
+
+    #[test]
+    fn known_prefix_does_not_false_match_underscore_identifier() {
+        let result = extract_at_mentions_with_known("hey @will_smith", &["Will"]);
+        assert_eq!(result, vec!["will_smith"]);
     }
 
     #[test]

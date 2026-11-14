@@ -143,7 +143,7 @@ function maskMarkdownCode(text: string): string {
 export function getMentionOffset(text: string, name: string): number | null {
   const escaped = escapeRegExp(name);
   const pattern = new RegExp(
-    `(^|\\s|\\(|[*_]{1,3}|\\|\\|)(@${escaped})(?=\\|\\||[\\s,;.!?:)\\]}*_]|$)`,
+    `(^|(?:^|[\\s([{<>"'|])[*_~]{1,3}|[\\s([{<>"'|~]|\\|\\|)(@${escaped})(?=\\|\\||_(?=[\\s,;.!?:)\\]}>"'*_~|]|$)|_{2,3}|[\\s,;.!?:)\\]}>"'*~|]|$)`,
     "i",
   );
   const match = pattern.exec(maskMarkdownCode(text));
