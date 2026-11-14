@@ -1075,12 +1075,6 @@ fn check_approver_spec(
 #[cfg(test)]
 mod approval_authority_tests {
     use super::{authorize_approval_actor, check_approver_spec};
-    use buzz_core::channel::{ChannelType, ChannelVisibility, MemberRole};
-    use buzz_core::tenant::TenantContext;
-    use buzz_db::workflow::{CreateApprovalParams, RunStatus};
-    use buzz_db::CreateCommunityWithOwnerResult;
-    use uuid::Uuid;
-
     const REQUESTER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const APPROVER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1101,147 +1095,6 @@ mod approval_authority_tests {
         assert!(check_approver_spec(APPROVER, APPROVER, REQUESTER, true).is_ok());
         assert!(check_approver_spec(APPROVER, REQUESTER, APPROVER, true).is_err());
         assert!(check_approver_spec("any", APPROVER, REQUESTER, true).is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires Postgres"]
-    async fn approval_authority_rechecks_membership_and_requester_in_the_database() {
-        let state = crate::workflow_sink::postgres_tests::test_state().await;
-        let owner = nostr::Keys::generate();
-        let approver = nostr::Keys::generate();
-        let outsider = nostr::Keys::generate();
-        let owner_bytes = owner.public_key().to_bytes();
-        let approver_bytes = approver.public_key().to_bytes();
-        let host = format!("approval-auth-{}.example", Uuid::new_v4().simple());
-        let community = match state
-            .db
-            .create_community_with_owner(
-                &host,
-                &owner.public_key().to_hex(),
-                &nostr::Keys::generate(),
-            )
-            .await
-            .map(|write| write.outcome)
-            .expect("create community")
-        {
-            CreateCommunityWithOwnerResult::Created(rec) => rec.id,
-            other => panic!("expected fresh community: {other:?}"),
-        };
-        let tenant = TenantContext::resolved(community, host);
-        let channel = state
-            .db
-            .create_channel(
-                community,
-                "approval-auth",
-                ChannelType::Stream,
-                ChannelVisibility::Open,
-                None,
-                &owner_bytes,
-                None,
-            )
-            .await
-            .expect("create channel");
-        state
-            .db
-            .ensure_user(community, &approver_bytes)
-            .await
-            .expect("create approver");
-        state
-            .db
-            .add_member(
-                community,
-                channel.id,
-                &approver_bytes,
-                MemberRole::Member,
-                Some(&owner_bytes),
-            )
-            .await
-            .expect("add approver");
-        let workflow_id = state
-            .db
-            .create_workflow(
-                community,
-                Some(channel.id),
-                &owner_bytes,
-                "approval-auth",
-                "{}",
-                &[0u8; 32],
-            )
-            .await
-            .expect("create workflow");
-        let context = serde_json::json!({"author": owner.public_key().to_hex()});
-        let run_id = state
-            .db
-            .create_workflow_run(
-                community,
-                workflow_id,
-                None,
-                Some(&context),
-                &buzz_db::workflow::RunCause::Event(owner_bytes.to_vec()),
-            )
-            .await
-            .expect("create run");
-        state
-            .db
-            .update_workflow_run(
-                community,
-                run_id,
-                RunStatus::WaitingApproval,
-                0,
-                &serde_json::json!([]),
-                None,
-            )
-            .await
-            .expect("wait for approval");
-        let token = Uuid::new_v4().to_string();
-        state
-            .db
-            .create_approval(CreateApprovalParams {
-                community_id: community,
-                token: &token,
-                workflow_id,
-                run_id,
-                step_id: "gate",
-                step_index: 0,
-                approver_spec: "any",
-                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-            })
-            .await
-            .expect("create approval");
-        let approval = state
-            .db
-            .get_approval(community, &token)
-            .await
-            .expect("read approval");
-
-        assert!(
-            authorize_approval_actor(&tenant, &state, &approval, &approver_bytes)
-                .await
-                .is_ok()
-        );
-        assert!(
-            authorize_approval_actor(&tenant, &state, &approval, &owner_bytes)
-                .await
-                .is_err()
-        );
-        assert!(authorize_approval_actor(
-            &tenant,
-            &state,
-            &approval,
-            &outsider.public_key().to_bytes(),
-        )
-        .await
-        .is_err());
-        state
-            .db
-            .remove_member(community, channel.id, &approver_bytes, &owner_bytes)
-            .await
-            .expect("remove approver");
-        assert!(
-            authorize_approval_actor(&tenant, &state, &approval, &approver_bytes)
-                .await
-                .is_err()
-        );
     }
 }
 
@@ -1646,6 +1499,150 @@ pub(crate) async fn resume_workflow_after_approval(
 #[cfg(test)]
 mod postgres_tests {
     use super::*;
+    use buzz_core::channel::{ChannelType, ChannelVisibility, MemberRole};
+    use buzz_db::workflow::CreateApprovalParams;
+    use buzz_db::CreateCommunityWithOwnerResult;
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn approval_authority_rechecks_membership_and_requester_in_the_database() {
+        let state = crate::workflow_sink::postgres_tests::test_state().await;
+        let owner = nostr::Keys::generate();
+        let approver = nostr::Keys::generate();
+        let outsider = nostr::Keys::generate();
+        let owner_bytes = owner.public_key().to_bytes();
+        let approver_bytes = approver.public_key().to_bytes();
+        let host = format!("approval-auth-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(
+                &host,
+                &owner.public_key().to_hex(),
+                &nostr::Keys::generate(),
+            )
+            .await
+            .map(|write| write.outcome)
+            .expect("create community")
+        {
+            CreateCommunityWithOwnerResult::Created(rec) => rec.id,
+            other => panic!("expected fresh community: {other:?}"),
+        };
+        let tenant = TenantContext::resolved(community, host);
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "approval-auth",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &owner_bytes,
+                None,
+            )
+            .await
+            .expect("create channel");
+        state
+            .db
+            .ensure_user(community, &approver_bytes)
+            .await
+            .expect("create approver");
+        state
+            .db
+            .add_member(
+                community,
+                channel.id,
+                &approver_bytes,
+                MemberRole::Member,
+                Some(&owner_bytes),
+            )
+            .await
+            .expect("add approver");
+        let workflow_id = state
+            .db
+            .create_workflow(
+                community,
+                Some(channel.id),
+                &owner_bytes,
+                "approval-auth",
+                "{}",
+                &[0u8; 32],
+            )
+            .await
+            .expect("create workflow");
+        let context = serde_json::json!({"author": owner.public_key().to_hex()});
+        let run_id = state
+            .db
+            .create_workflow_run(
+                community,
+                workflow_id,
+                None,
+                Some(&context),
+                &buzz_db::workflow::RunCause::Event(owner_bytes.to_vec()),
+            )
+            .await
+            .expect("create run");
+        state
+            .db
+            .update_workflow_run(
+                community,
+                run_id,
+                RunStatus::WaitingApproval,
+                0,
+                &serde_json::json!([]),
+                None,
+            )
+            .await
+            .expect("wait for approval");
+        let token = Uuid::new_v4().to_string();
+        state
+            .db
+            .create_approval(CreateApprovalParams {
+                community_id: community,
+                token: &token,
+                workflow_id,
+                run_id,
+                step_id: "gate",
+                step_index: 0,
+                approver_spec: "any",
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            })
+            .await
+            .expect("create approval");
+        let approval = state
+            .db
+            .get_approval(community, &token)
+            .await
+            .expect("read approval");
+
+        assert!(
+            authorize_approval_actor(&tenant, &state, &approval, &approver_bytes)
+                .await
+                .is_ok()
+        );
+        assert!(
+            authorize_approval_actor(&tenant, &state, &approval, &owner_bytes)
+                .await
+                .is_err()
+        );
+        assert!(authorize_approval_actor(
+            &tenant,
+            &state,
+            &approval,
+            &outsider.public_key().to_bytes(),
+        )
+        .await
+        .is_err());
+        state
+            .db
+            .remove_member(community, channel.id, &approver_bytes, &owner_bytes)
+            .await
+            .expect("remove approver");
+        assert!(
+            authorize_approval_actor(&tenant, &state, &approval, &approver_bytes)
+                .await
+                .is_err()
+        );
+    }
+
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
     async fn persistence_test_context() -> (buzz_db::Db, TenantContext) {
