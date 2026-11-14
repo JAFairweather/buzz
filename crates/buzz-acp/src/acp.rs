@@ -207,6 +207,8 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Set from the initialize response: the agent accepts `session/close`.
+    session_close_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -629,6 +631,7 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            session_close_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -692,8 +695,24 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.session_close_supported = advertises_session_close(&result);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
+    }
+
+    /// Whether the agent advertised `sessionCapabilities.close` at initialize.
+    pub fn supports_session_close(&self) -> bool {
+        self.session_close_supported
+    }
+
+    /// Send `session/close`: the agent ends the session and frees what it
+    /// holds for it, including the session's MCP server processes.
+    pub async fn session_close(&mut self, session_id: &str) -> Result<serde_json::Value, AcpError> {
+        self.send_request(
+            "session/close",
+            serde_json::json!({ "sessionId": session_id }),
+        )
+        .await
     }
 
     /// Send the ACP `authenticate` request for an adapter-advertised method.
@@ -2202,6 +2221,14 @@ fn permission_response_cancelled(id: &serde_json::Value) -> serde_json::Value {
         "id": id,
         "result": { "outcome": { "outcome": "cancelled" } }
     })
+}
+
+/// Whether an initialize result advertises `agentCapabilities.sessionCapabilities.close`
+/// (ACP: an object when supported, absent or null otherwise).
+pub(crate) fn advertises_session_close(init_result: &serde_json::Value) -> bool {
+    init_result
+        .pointer("/agentCapabilities/sessionCapabilities/close")
+        .is_some_and(|v| v.is_object())
 }
 
 /// Full `session/new` response — session ID plus the raw JSON result.
