@@ -480,6 +480,16 @@ pub struct SendMessageParams {
     pub files: Vec<String>,
 }
 
+fn validate_message_body(content: &str) -> Result<(), CliError> {
+    if content.trim().is_empty() {
+        return Err(CliError::Usage(
+            "message content is empty; refusing to publish (check stdin when using --content -)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn cmd_send_message(
     client: &BuzzClient,
     mut p: SendMessageParams,
@@ -517,6 +527,7 @@ pub async fn cmd_send_message(
     } else {
         format!("{}{media_content}", p.content)
     };
+    validate_message_body(&final_content)?;
 
     // Build thread ref if replying. `--reply-to` is the immediate parent; the
     // thread root is derived from the parent's NIP-10 tags via the relay.
@@ -876,7 +887,9 @@ pub async fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_root_from_tags, match_profiles_by_name, parse_member_pubkeys};
+    use super::{
+        find_root_from_tags, match_profiles_by_name, parse_member_pubkeys, validate_message_body,
+    };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
     };
@@ -891,6 +904,15 @@ mod tests {
     const PK_VALID_A: &str = "35c18ae273fccfaf80d629e20e7f8721b90499379addff533054acc2504c12b4";
     const PK_VALID_B: &str = "c6237ef84fa537c78dcee78efd2d4e59f728859c7f194da42ac51ededfa0be05";
     const PK_VALID_C: &str = "f4a42a97e594b77bdbd8ee35191c8b28a94a4cb871d96f32921558275421fb68";
+
+    #[test]
+    fn send_rejects_empty_stdin_but_allows_text_and_attachment_markdown() {
+        for body in ["", " \t\n", "\r\n"] {
+            assert!(validate_message_body(body).is_err());
+        }
+        assert!(validate_message_body("hello").is_ok());
+        assert!(validate_message_body("\n![image](https://example.test/image.png)").is_ok());
+    }
 
     #[test]
     fn root_marker_wins_over_reply_marker() {
