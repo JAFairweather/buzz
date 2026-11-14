@@ -1527,6 +1527,11 @@ mod postgres_tests {
             other => panic!("expected fresh community: {other:?}"),
         };
         let tenant = TenantContext::resolved(community, host);
+        state
+            .db
+            .ensure_user(community, &owner_bytes)
+            .await
+            .expect("create owner");
         let channel = state
             .db
             .create_channel(
