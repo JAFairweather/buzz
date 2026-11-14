@@ -367,15 +367,12 @@ impl ActionSink for RelayActionSink {
                         "approval recipient is not a channel member".into(),
                     ));
                 }
-                if recipient
-                    != nostr::PublicKey::from_hex(&author_pubkey_hex).map_err(|e| {
-                        ActionSinkError::InvalidInput(format!("invalid owner pubkey: {e}"))
-                    })?
-                {
-                    tags.push(Tag::parse(["p", &recipient.to_hex()]).map_err(|e| {
-                        ActionSinkError::EventBuild(format!("recipient p tag: {e}"))
-                    })?);
-                }
+                // The owner attribution tag is marked `owner` and does not
+                // notify. An approval addressed to the workflow owner still
+                // needs a separate plain p tag to reach its approver.
+                tags.push(Tag::parse(["p", &recipient.to_hex()]).map_err(|e| {
+                    ActionSinkError::EventBuild(format!("recipient p tag: {e}"))
+                })?);
             }
 
             // Resolve thread ancestry when this is a threaded reply, so the
@@ -1276,6 +1273,29 @@ pub(crate) mod postgres_tests {
             .event_id;
         let notice = load_event(&notice_id).await;
         assert!(tag_values(&notice, "p").contains(&agent_hex));
+
+        let owner_notice_id = RelayActionSink::new(&state)
+            .send_message(
+                community,
+                &channel.id.to_string(),
+                "Approval requested from owner",
+                "Approval requested from owner",
+                false,
+                &author_hex,
+                None,
+                Some(&author_hex),
+            )
+            .await
+            .expect("send owner approval notice")
+            .event_id;
+        let owner_notice = load_event(&owner_notice_id).await;
+        assert!(
+            owner_notice
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["p", author_hex.as_str()]),
+            "owner-as-approver must have a notifying plain p tag beside owner attribution"
+        );
     }
 
     #[tokio::test]
