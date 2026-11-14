@@ -12,6 +12,9 @@
 use std::collections::HashMap;
 
 use buzz_core::tenant::CommunityId;
+use buzz_db::workflow::RunCause;
+
+use crate::AgentMentions;
 use evalexpr::HashMapContext;
 use nostr::ToBech32;
 use serde_json::Value as JsonValue;
@@ -37,6 +40,10 @@ pub struct TriggerContext {
     pub emoji: String,
     /// Event ID of the triggering message (hex string).
     pub message_id: String,
+    /// True when the triggering event is itself a threaded reply (carries a
+    /// NIP-10 `reply`/`root` marker e-tag). Lets a `message_posted` filter
+    /// select only top-level messages via `trigger_is_reply == false`.
+    pub is_reply: bool,
     /// Arbitrary webhook body fields (webhook trigger).
     pub webhook_fields: HashMap<String, String>,
 }
@@ -213,6 +220,7 @@ fn apply_filter(value: String, filter: &str) -> Result<String, WorkflowError> {
 /// | `trigger.timestamp`               | `trigger_timestamp`       |
 /// | `trigger.emoji`                   | `trigger_emoji`           |
 /// | `trigger.message_id`              | `trigger_message_id`      |
+/// | `trigger.is_reply`                | `trigger_is_reply` (bool) |
 /// | `steps.STEP_ID.output.FIELD`      | `steps_STEP_ID_output_FIELD` |
 ///
 /// Also registers string helper functions that the `cron` crate's `evalexpr` v11
@@ -299,6 +307,14 @@ pub fn build_eval_context(
         ctx.set_value((*name).into(), Value::String((*val).to_owned()))
             .map_err(|e| WorkflowError::ConditionError(e.to_string()))?;
     }
+
+    // `trigger_is_reply` is boolean (not a string field), so a filter can read
+    // `trigger_is_reply == false` to fire only on top-level messages.
+    ctx.set_value(
+        "trigger_is_reply".into(),
+        Value::Boolean(trigger_ctx.is_reply),
+    )
+    .map_err(|e| WorkflowError::ConditionError(e.to_string()))?;
 
     for (step_id, output) in step_outputs {
         if let JsonValue::Object(map) = output {
@@ -403,9 +419,14 @@ pub fn resolve_step_templates(
     };
 
     match &step.action {
-        SendMessage { text, channel } => Ok(SendMessage {
+        SendMessage {
+            text,
+            channel,
+            reply_in_thread,
+        } => Ok(SendMessage {
             text: t(text)?,
             channel: t_opt(channel)?,
+            reply_in_thread: *reply_in_thread,
         }),
         SendDm { to, text } => Ok(SendDm {
             to: t(to)?,
@@ -509,6 +530,53 @@ fn resolve_send_message_channel(
     Ok(trigger_channel.trim().to_string())
 }
 
+/// Whether every step of `def` is an action that takes no input from outside
+/// the owner's control. An allowlist: any other action, including one added
+/// later, makes the definition ineligible to direct agents.
+pub fn definition_may_direct_agents(def: &WorkflowDef) -> bool {
+    def.steps.iter().all(|step| {
+        matches!(
+            step.action,
+            ActionDef::SendMessage { .. } | ActionDef::Delay { .. }
+        )
+    })
+}
+
+/// Whether a run's recorded cause lets its messages direct the owner's agents:
+/// a timer, or an event or manual trigger signed by the owner. Webhook calls
+/// and runs with no recorded cause never qualify.
+pub fn cause_may_direct_agents(cause: Option<&RunCause>, owner_pubkey: &[u8]) -> bool {
+    match cause {
+        Some(RunCause::Schedule) => true,
+        Some(RunCause::Event(pubkey) | RunCause::Manual(pubkey)) => pubkey == owner_pubkey,
+        Some(RunCause::Webhook) | None => false,
+    }
+}
+
+/// Why a `send_message` step withholds `buzz:workflow-mention` tags, in the
+/// order recorded in its trace: `cause` (not started by the owner or a timer),
+/// `steps` (the definition has a step other than `send_message` or `delay`),
+/// and `resumed` (the run resumed after an approval). Empty when the message
+/// may direct agents, which is always the case in [`AgentMentions::Any`].
+pub fn agent_mentions_withheld_reasons(
+    mode: AgentMentions,
+    cause_may_direct_agents: bool,
+    definition_may_direct_agents: bool,
+    resumed: bool,
+) -> Vec<&'static str> {
+    if mode == AgentMentions::Any {
+        return Vec::new();
+    }
+    [
+        (!cause_may_direct_agents, "cause"),
+        (!definition_may_direct_agents, "steps"),
+        (resumed, "resumed"),
+    ]
+    .into_iter()
+    .filter_map(|(applies, reason)| applies.then_some(reason))
+    .collect()
+}
+
 /// Dispatch a resolved action and return its output.
 ///
 /// For MVP, most actions log their intent and return a success output.
@@ -516,175 +584,283 @@ fn resolve_send_message_channel(
 ///
 /// `RequestApproval` returns `StepResult::Suspended` — the caller must
 /// persist state and stop the execution loop.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_action(
-    step_id: &str,
+    step: &Step,
     action: &ActionDef,
     engine: &WorkflowEngine,
     community_id: CommunityId,
     run_id: Uuid,
     trigger_ctx: &TriggerContext,
+    definition_may_direct_agents: bool,
+    resumed: bool,
 ) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
 
-    match action {
-        SendMessage { text, channel } => {
-            // Look up workflow metadata for destination validation and
-            // attribution, scoped to the run's community — the same run/workflow
-            // UUID may exist in another community, so a bare-id lookup could
-            // load the wrong row and drive a side effect under it.
-            let wf_run = engine
-                .db
-                .get_workflow_run(community_id, run_id)
-                .await
-                .map_err(|e| {
-                    WorkflowError::WebhookError(format!(
-                        "SendMessage: failed to load workflow run {run_id}: {e}"
-                    ))
-                })?;
-            let workflow = engine
-                .db
-                .get_workflow(community_id, wf_run.workflow_id)
-                .await
-                .map_err(|e| {
-                    WorkflowError::WebhookError(format!(
-                        "SendMessage: failed to load workflow {}: {e}",
-                        wf_run.workflow_id
-                    ))
-                })?;
-            let channel_id = resolve_send_message_channel(
-                channel.as_deref(),
-                &trigger_ctx.channel_id,
-                workflow.channel_id,
-            )?;
-            let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
+    let step_id = &step.id;
 
-            info!(
-                run_id = %run_id,
-                step = step_id,
-                channel = %channel_id,
-                "SendMessage → {channel_id}: {text}"
-            );
-
-            let event_id = engine
-                .action_sink()?
-                .send_message(community_id, &channel_id, text, &owner_pubkey_hex)
-                .await
-                .map_err(WorkflowError::from)?;
-
-            Ok(StepResult::Completed(serde_json::json!({
-                "sent": true,
-                "event_id": event_id,
-            })))
-        }
-
-        SendDm { to, text: _ } => {
-            warn!(run_id = %run_id, step = step_id, "SendDm not yet implemented (to={to})");
-            // TODO (WF-07): emit DM event.
-            Err(WorkflowError::NotImplemented("SendDm".into()))
-        }
-
-        SetChannelTopic { topic: _ } => {
-            warn!(run_id = %run_id, step = step_id, "SetChannelTopic not yet implemented");
-            // TODO (WF-07): update channel topic via DB.
-            Err(WorkflowError::NotImplemented("SetChannelTopic".into()))
-        }
-
-        AddReaction { emoji } => {
-            info!(run_id = %run_id, step = step_id, "AddReaction → :{emoji}:");
-            if trigger_ctx.message_id.is_empty() {
-                return Err(WorkflowError::InvalidDefinition(
-                    "AddReaction: no trigger.message_id available".into(),
-                ));
-            }
-
-            #[cfg(feature = "reqwest")]
-            {
-                let result = add_reaction_impl(&trigger_ctx.message_id, emoji).await?;
-                Ok(StepResult::Completed(result))
-            }
-
-            #[cfg(not(feature = "reqwest"))]
-            {
-                warn!(
-                    run_id = %run_id,
-                    step = step_id,
-                    "AddReaction: reqwest feature not enabled, skipping HTTP call"
-                );
-                Ok(StepResult::Completed(
-                    serde_json::json!({ "added": false, "skipped": true }),
+    // The workflow engine can outlive the serving request that spawned it.
+    // Revalidate the durable community fence immediately before every external
+    // side effect (message publish, webhook, delay/resume). A storage failure is
+    // a denial, never permission to continue.
+    let serving_write =
+        buzz_deletion::acquire_serving_write(&engine.db, community_id, "workflow_action")
+            .await
+            .map_err(|error| {
+                WorkflowError::WebhookError(format!(
+                    "community write fence rejected workflow side effect: {error}"
                 ))
-            }
-        }
+            })?;
 
-        CallWebhook {
-            url,
-            method,
-            headers,
-            body,
-        } => {
-            let method_str = method.as_deref().unwrap_or("POST");
-            info!(run_id = %run_id, step = step_id, "CallWebhook → {method_str} {url}");
+    serving_write.verify().await.map_err(|error| {
+        WorkflowError::WebhookError(format!("community write lease lost: {error}"))
+    })?;
 
-            #[cfg(feature = "reqwest")]
-            {
-                let result = call_webhook_impl(url, method_str, headers, body).await?;
-                Ok(StepResult::Completed(result))
-            }
+    let result = serving_write
+        .protect(async {
+            match action {
+                SendMessage {
+                    text,
+                    channel,
+                    reply_in_thread,
+                } => {
+                    // Look up workflow metadata for destination validation and
+                    // attribution, scoped to the run's community — the same run/workflow
+                    // UUID may exist in another community, so a bare-id lookup could
+                    // load the wrong row and drive a side effect under it.
+                    let wf_run = engine
+                        .db
+                        .get_workflow_run(community_id, run_id)
+                        .await
+                        .map_err(|e| {
+                            WorkflowError::WebhookError(format!(
+                                "SendMessage: failed to load workflow run {run_id}: {e}"
+                            ))
+                        })?;
+                    let workflow = engine
+                        .db
+                        .get_workflow(community_id, wf_run.workflow_id)
+                        .await
+                        .map_err(|e| {
+                            WorkflowError::WebhookError(format!(
+                                "SendMessage: failed to load workflow {}: {e}",
+                                wf_run.workflow_id
+                            ))
+                        })?;
+                    let channel_id = resolve_send_message_channel(
+                        channel.as_deref(),
+                        &trigger_ctx.channel_id,
+                        workflow.channel_id,
+                    )?;
+                    let owner_pubkey_hex = hex::encode(&workflow.owner_pubkey);
+                    let withheld_reasons = agent_mentions_withheld_reasons(
+                        engine.config.agent_mentions,
+                        cause_may_direct_agents(wf_run.cause.as_ref(), &workflow.owner_pubkey),
+                        definition_may_direct_agents,
+                        resumed,
+                    );
 
-            #[cfg(not(feature = "reqwest"))]
-            {
-                // reqwest not enabled — log and return placeholder.
-                warn!(
-                    run_id = %run_id, step = step_id,
-                    "CallWebhook: reqwest feature not enabled, skipping HTTP call"
-                );
-                let _ = (headers, body); // suppress unused warnings
-                Ok(StepResult::Completed(serde_json::json!({
-                    "status": 0,
-                    "body": null,
-                    "skipped": true
-                })))
-            }
-        }
+                    // Thread the reply onto the triggering message when requested.
+                    // The trigger must carry the event to reply to; schema
+                    // validation already forbids `reply_in_thread` on triggers
+                    // that have no message, so an empty id here is a real fault.
+                    let reply_to = if *reply_in_thread {
+                        if trigger_ctx.message_id.is_empty() {
+                            return Err(WorkflowError::InvalidDefinition(
+                                "SendMessage: reply_in_thread is set but the trigger has no message_id to reply to".into(),
+                            ));
+                        }
+                        Some(trigger_ctx.message_id.as_str())
+                    } else {
+                        None
+                    };
 
-        RequestApproval {
-            from,
-            message,
-            timeout,
-        } => {
-            let timeout_str = timeout.as_deref().unwrap_or("24h");
-            info!(
-                run_id = %run_id, step = step_id,
-                "RequestApproval from={from} timeout={timeout_str}: {message}"
-            );
+                    info!(
+                        run_id = %run_id,
+                        step = step_id,
+                        channel = %channel_id,
+                        reply_in_thread = *reply_in_thread,
+                        "SendMessage → {channel_id}: {text}"
+                    );
 
-            let token = generate_approval_token(run_id, step_id);
+                    let authored_text = match &step.action {
+                        SendMessage { text, .. } => text.as_str(),
+                        _ => {
+                            return Err(WorkflowError::InvalidDefinition(
+                                "SendMessage: resolved action does not match its authored step"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    let sent = engine
+                        .action_sink()?
+                        .send_message(
+                            community_id,
+                            &channel_id,
+                            text,
+                            authored_text,
+                            withheld_reasons.is_empty(),
+                            &owner_pubkey_hex,
+                            reply_to,
+                        )
+                        .await
+                        .map_err(WorkflowError::from)?;
 
-            // TODO (WF-08): create approval record in DB, emit kind:46010.
-            // For now, return Suspended with the token so the caller can persist state.
+                    let mut output = serde_json::json!({
+                        "sent": true,
+                        "event_id": sent.event_id,
+                    });
+                    if sent.agent_mentions_withheld {
+                        info!(
+                            target: crate::AGENT_MENTIONS_LOG_TARGET,
+                            community = %community_id,
+                            workflow = %wf_run.workflow_id,
+                            run_id = %run_id,
+                            step = step_id,
+                            reasons = ?withheld_reasons,
+                            "owner-only agent mentions withheld buzz:workflow-mention tags"
+                        );
+                        for reason in &withheld_reasons {
+                            metrics::counter!(
+                                "buzz_workflow_agent_mentions_withheld_total",
+                                "reason" => *reason
+                            )
+                            .increment(1);
+                        }
+                        output["agent_mentions"] = serde_json::json!({
+                            "withheld": true,
+                            "reasons": withheld_reasons,
+                        });
+                    }
+                    Ok(StepResult::Completed(output))
+                }
 
-            Ok(StepResult::Suspended {
-                approval_token: token,
-            })
-        }
+                SendDm { to, text: _ } => {
+                    warn!(run_id = %run_id, step = step_id, "SendDm not yet implemented (to={to})");
+                    // TODO (WF-07): emit DM event.
+                    Err(WorkflowError::NotImplemented("SendDm".into()))
+                }
 
-        Delay { duration } => {
-            let secs = parse_duration_secs(duration)?;
-            // Cap delay at 270 seconds (4.5 minutes) — must be less than default_timeout_secs (300s)
-            // to avoid non-deterministic StepTimeout. Long delays (hours/days)
-            // should use the scheduled resume pattern (future work: WF-09).
-            const MAX_DELAY_SECS: u64 = 270;
-            if secs > MAX_DELAY_SECS {
-                return Err(WorkflowError::InvalidDefinition(format!(
-                    "delay exceeds maximum of {MAX_DELAY_SECS} seconds (got {secs}s); \
+                SetChannelTopic { topic: _ } => {
+                    warn!(run_id = %run_id, step = step_id, "SetChannelTopic not yet implemented");
+                    // TODO (WF-07): update channel topic via DB.
+                    Err(WorkflowError::NotImplemented("SetChannelTopic".into()))
+                }
+
+                AddReaction { emoji } => {
+                    info!(run_id = %run_id, step = step_id, "AddReaction → :{emoji}:");
+                    if trigger_ctx.message_id.is_empty() {
+                        Err(WorkflowError::InvalidDefinition(
+                            "AddReaction: no trigger.message_id available".into(),
+                        ))
+                    } else {
+                        #[cfg(feature = "reqwest")]
+                        {
+                            let result = add_reaction_impl(&trigger_ctx.message_id, emoji).await?;
+                            Ok(StepResult::Completed(result))
+                        }
+
+                        #[cfg(not(feature = "reqwest"))]
+                        {
+                            warn!(
+                                run_id = %run_id,
+                                step = step_id,
+                                "AddReaction: reqwest feature not enabled, skipping HTTP call"
+                            );
+                            Ok(StepResult::Completed(
+                                serde_json::json!({ "added": false, "skipped": true }),
+                            ))
+                        }
+                    }
+                }
+
+                CallWebhook {
+                    url,
+                    method,
+                    headers,
+                    body,
+                } => {
+                    let method_str = method.as_deref().unwrap_or("POST");
+                    info!(run_id = %run_id, step = step_id, "CallWebhook → {method_str} {url}");
+
+                    #[cfg(feature = "reqwest")]
+                    {
+                        let result = call_webhook_impl(url, method_str, headers, body).await?;
+                        Ok(StepResult::Completed(result))
+                    }
+
+                    #[cfg(not(feature = "reqwest"))]
+                    {
+                        // reqwest not enabled — log and return placeholder.
+                        warn!(
+                            run_id = %run_id, step = step_id,
+                            "CallWebhook: reqwest feature not enabled, skipping HTTP call"
+                        );
+                        let _ = (headers, body); // suppress unused warnings
+                        Ok(StepResult::Completed(serde_json::json!({
+                            "status": 0,
+                            "body": null,
+                            "skipped": true
+                        })))
+                    }
+                }
+
+                RequestApproval {
+                    from,
+                    message,
+                    timeout,
+                } => {
+                    let timeout_str = timeout.as_deref().unwrap_or("24h");
+                    info!(
+                        run_id = %run_id, step = step_id,
+                        "RequestApproval from={from} timeout={timeout_str}: {message}"
+                    );
+
+                    let token = generate_approval_token(run_id, step_id);
+
+                    // TODO (WF-08): create approval record in DB, emit kind:46010.
+                    // For now, return Suspended with the token so the caller can persist state.
+
+                    Ok(StepResult::Suspended {
+                        approval_token: token,
+                    })
+                }
+
+                Delay { duration } => {
+                    let secs = parse_duration_secs(duration)?;
+                    // Cap delay at 270 seconds (4.5 minutes) — must be less than default_timeout_secs (300s)
+                    // to avoid non-deterministic StepTimeout. Long delays (hours/days)
+                    // should use the scheduled resume pattern (future work: WF-09).
+                    const MAX_DELAY_SECS: u64 = 270;
+                    if secs > MAX_DELAY_SECS {
+                        return Err(WorkflowError::InvalidDefinition(format!(
+                            "delay exceeds maximum of {MAX_DELAY_SECS} seconds (got {secs}s); \
                      use the scheduled resume pattern for long delays"
-                )));
+                        )));
+                    }
+                    info!(run_id = %run_id, step = step_id, "Delay {duration} ({secs}s)");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                    Ok(StepResult::Completed(
+                        serde_json::json!({ "slept_secs": secs }),
+                    ))
+                }
             }
-            info!(run_id = %run_id, step = step_id, "Delay {duration} ({secs}s)");
-            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            Ok(StepResult::Completed(
-                serde_json::json!({ "slept_secs": secs }),
-            ))
+        })
+        .await
+        .map_err(|error| {
+            WorkflowError::WebhookError(format!("community write lease lost: {error}"))
+        })?;
+    let release = serving_write.finish().await.map_err(|error| {
+        WorkflowError::WebhookError(format!("community write lease release failed: {error}"))
+    });
+    match result {
+        Ok(value) => {
+            release?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = release;
+            Err(error)
         }
     }
 }
@@ -805,6 +981,9 @@ async fn call_webhook_impl(
     // different address than the one validated above (DNS rebinding TOCTOU).
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
+        // A system proxy would resolve the original hostname itself, bypassing
+        // the validated and pinned address above.
+        .no_proxy()
         // Disable redirects — a redirect to an internal host bypasses the SSRF check.
         .redirect(reqwest::redirect::Policy::none())
         .resolve(host, std::net::SocketAddr::new(safe_ip, port))
@@ -997,10 +1176,11 @@ pub async fn execute_run(
             )
         })?;
 
-    execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
+    execute_steps(engine, community_id, run_id, def, trigger_ctx, None).await
 }
 
-/// Resume execution from a specific step index (used for approval resume).
+/// Resume a run after its approval was granted, from a specific step index.
+/// With owner-only agent mentions, messages from a resumed run never direct agents.
 ///
 /// Acquires a concurrency permit from `engine.run_semaphore` before executing —
 /// returns [`WorkflowError::CapacityExceeded`] immediately if all permits are
@@ -1065,13 +1245,13 @@ pub async fn execute_from_step(
         run_id,
         def,
         trigger_ctx,
-        start_index,
-        initial_outputs,
+        Some((start_index, initial_outputs.unwrap_or_default())),
     )
     .await
 }
 
-/// Internal: execute workflow steps starting from `start_index`, without
+/// Internal: execute workflow steps from the start, or from `resume`'s step
+/// index with its restored outputs, without
 /// acquiring the semaphore. Called by both [`execute_run`] and
 /// [`execute_from_step`] after they have already acquired a permit.
 ///
@@ -1083,10 +1263,13 @@ async fn execute_steps(
     run_id: Uuid,
     def: &WorkflowDef,
     trigger_ctx: &TriggerContext,
-    start_index: usize,
-    initial_outputs: Option<HashMap<String, JsonValue>>,
+    resume: Option<(usize, HashMap<String, JsonValue>)>,
 ) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
-    let mut step_outputs: HashMap<String, JsonValue> = initial_outputs.unwrap_or_default();
+    // A resumed run continues on restored outputs and on a definition that
+    // may have changed since the approval, so it never directs agents.
+    let resumed = resume.is_some();
+    let definition_may_direct_agents = definition_may_direct_agents(def);
+    let (start_index, mut step_outputs) = resume.unwrap_or_default();
     let mut trace: Vec<JsonValue> = Vec::new();
 
     for (i, step) in def.steps.iter().enumerate() {
@@ -1109,7 +1292,12 @@ async fn execute_steps(
                     continue;
                 }
                 Err(e) => {
-                    warn!(run_id = %run_id, step = %step.id, "Condition error: {e}");
+                    warn!(
+                        run_id = %run_id,
+                        step = %step.id,
+                        error_kind = e.code(),
+                        "Condition error"
+                    );
                     let progress = crate::error::PartialProgress {
                         step_index: i,
                         trace,
@@ -1136,12 +1324,14 @@ async fn execute_steps(
         let dispatch_result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             dispatch_action(
-                &step.id,
+                step,
                 &resolved_action,
                 engine,
                 community_id,
                 run_id,
                 trigger_ctx,
+                definition_may_direct_agents,
+                resumed,
             ),
         )
         .await;
@@ -1226,6 +1416,7 @@ mod tests {
             timestamp: "1700000000".to_owned(),
             emoji: "fire".to_owned(),
             message_id: "event-id-hex".to_owned(),
+            is_reply: false,
             webhook_fields: HashMap::new(),
         }
     }
@@ -1343,6 +1534,56 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn condition_trigger_is_reply_selects_top_level_only() {
+        // The top-level-only filter from the feature's use case.
+        let mut ctx = make_trigger();
+
+        ctx.is_reply = false;
+        assert!(
+            evaluate_condition("trigger_is_reply == false", &ctx, &HashMap::new())
+                .await
+                .unwrap(),
+            "top-level message should pass the filter"
+        );
+
+        ctx.is_reply = true;
+        assert!(
+            !evaluate_condition("trigger_is_reply == false", &ctx, &HashMap::new())
+                .await
+                .unwrap(),
+            "threaded reply should be filtered out"
+        );
+    }
+
+    #[test]
+    fn resolve_step_templates_carries_reply_in_thread() {
+        let ctx = make_trigger();
+        let step = Step {
+            id: "reply".to_owned(),
+            name: None,
+            if_expr: None,
+            timeout_secs: None,
+            action: ActionDef::SendMessage {
+                text: "hi {{trigger.author}}".to_owned(),
+                channel: None,
+                reply_in_thread: true,
+            },
+        };
+        let resolved = resolve_step_templates(&step, &ctx, &HashMap::new()).unwrap();
+        match resolved {
+            ActionDef::SendMessage {
+                text,
+                reply_in_thread,
+                ..
+            } => {
+                assert_eq!(text, "hi abc123def456");
+                assert!(reply_in_thread, "reply_in_thread must survive resolution");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1830,5 +2071,94 @@ mod tests {
             resolve_send_message_channel(Some(&override_channel_id.to_string()), "", None)
                 .expect("override should be accepted");
         assert_eq!(resolved, override_channel_id.to_string());
+    }
+    fn def_with_steps(steps: &str) -> WorkflowDef {
+        crate::WorkflowEngine::parse_yaml(&format!(
+            "name: eligibility\ntrigger:\n  on: message_posted\nsteps:\n{steps}"
+        ))
+        .expect("parse definition")
+        .0
+    }
+
+    #[test]
+    fn only_send_message_and_delay_definitions_may_direct_agents() {
+        let send = "  - id: send\n    action: send_message\n    text: '@Agent go'\n";
+        let delay = "  - id: wait\n    action: delay\n    duration: 1m\n";
+        assert!(definition_may_direct_agents(&def_with_steps(&format!(
+            "{send}{delay}"
+        ))));
+
+        // A webhook response can choose fixed text through `if:` without
+        // contributing any rendered characters; the whole definition is out.
+        let webhook_selects_text = format!(
+            "  - id: hook\n    action: call_webhook\n    url: https://example.com/x\n\
+             {send}    if: steps.hook.output.status == 200\n"
+        );
+        assert!(!definition_may_direct_agents(&def_with_steps(
+            &webhook_selects_text
+        )));
+
+        for other in [
+            "  - id: approve\n    action: request_approval\n    from: '@manager'\n    message: ok?\n",
+            "  - id: react\n    action: add_reaction\n    emoji: eyes\n",
+            "  - id: dm\n    action: send_dm\n    to: '@manager'\n    text: hi\n",
+            "  - id: topic\n    action: set_channel_topic\n    topic: hi\n",
+        ] {
+            assert!(
+                !definition_may_direct_agents(&def_with_steps(&format!("{send}{other}"))),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_mode_lists_every_withheld_reason_in_order() {
+        use AgentMentions::{Any, Owner};
+        assert!(agent_mentions_withheld_reasons(Any, false, false, true).is_empty());
+        assert!(agent_mentions_withheld_reasons(Owner, true, true, false).is_empty());
+        assert_eq!(
+            agent_mentions_withheld_reasons(Owner, false, true, false),
+            ["cause"]
+        );
+        assert_eq!(
+            agent_mentions_withheld_reasons(Owner, true, false, false),
+            ["steps"]
+        );
+        assert_eq!(
+            agent_mentions_withheld_reasons(Owner, true, true, true),
+            ["resumed"]
+        );
+        assert_eq!(
+            agent_mentions_withheld_reasons(Owner, false, false, true),
+            ["cause", "steps", "resumed"]
+        );
+    }
+
+    #[test]
+    fn only_owner_and_timer_causes_may_direct_agents() {
+        let owner = vec![1u8; 32];
+        let other = vec![2u8; 32];
+        assert!(cause_may_direct_agents(Some(&RunCause::Schedule), &owner));
+        assert!(cause_may_direct_agents(
+            Some(&RunCause::Event(owner.clone())),
+            &owner
+        ));
+        assert!(cause_may_direct_agents(
+            Some(&RunCause::Manual(owner.clone())),
+            &owner
+        ));
+        assert!(!cause_may_direct_agents(
+            Some(&RunCause::Event(other.clone())),
+            &owner
+        ));
+        assert!(!cause_may_direct_agents(
+            Some(&RunCause::Manual(other)),
+            &owner
+        ));
+        assert!(!cause_may_direct_agents(Some(&RunCause::Webhook), &owner));
+        assert!(
+            !cause_may_direct_agents(None, &owner),
+            "legacy runs have no cause"
+        );
     }
 }

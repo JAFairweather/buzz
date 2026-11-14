@@ -7,12 +7,13 @@ import { flushSync } from "react-dom";
 
 import { AnimatedAvatarCapture } from "@/features/profile/ui/AnimatedAvatarCapture";
 import { AvatarCustomColorPanel } from "@/features/profile/ui/AvatarCustomColorPanel";
-import { ProfileAvatarUploadPreview } from "@/features/profile/ui/ProfileAvatarUploadPreview";
 import { ProfileAvatarModeTabs } from "@/features/profile/ui/ProfileAvatarModeTabs";
+import { useAvatarSelection } from "@/features/profile/avatarPresentationStore";
 import { useAvatarUpload } from "@/features/profile/useAvatarUpload";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { useEmojiBurst } from "@/shared/ui/EmojiBurstProvider";
+import { useSmoothCorners } from "@/shared/ui/smoothCorners";
 import { Spinner } from "@/shared/ui/spinner";
 import {
   DONE_BUTTON_CONTENT_TRANSITION,
@@ -71,12 +72,12 @@ export function ProfileAvatarEditor({
   onCustomColorPickerOpenChange,
   onEmojiAvatarChange,
   onModeChange,
+  onLocalPreviewChange,
   onUploadedAvatarChange,
   onUrlChange,
   onAnimatedAvatarApply,
   onDone,
   onUploadingChange,
-  previewName,
   showEmojiColorControlsWhenEmpty = false,
   disabled,
   testIdPrefix = "profile-avatar",
@@ -85,6 +86,8 @@ export function ProfileAvatarEditor({
   onAnimatedPreviewActiveChange,
   onAnimatedPreviewCaptionChange,
   presentation = "default",
+  compactCustomColorPicker = false,
+  stackAnimatedCameraOptions = false,
 }: ProfileAvatarEditorProps) {
   const { burstEmoji } = useEmojiBurst();
   const shouldReduceMotion = useReducedMotion();
@@ -96,6 +99,9 @@ export function ProfileAvatarEditor({
   const [isDragging, setIsDragging] = React.useState(false);
   const [urlDraft, setUrlDraft] = React.useState("");
   const localPreview = useLocalAvatarPreview();
+  React.useEffect(() => {
+    onLocalPreviewChange?.(localPreview.previewUrl);
+  }, [localPreview.previewUrl, onLocalPreviewChange]);
   const [selectedEmoji, setSelectedEmoji] = React.useState<string | null>(
     () => initialEmojiAvatar?.emoji ?? null,
   );
@@ -134,7 +140,18 @@ export function ProfileAvatarEditor({
               "--buzz-emoji-picker-padding": "10px",
               "--buzz-emoji-picker-scroll-padding-top": "18px",
             }
-          : null),
+          : presentation === "onboarding-inline"
+            ? {
+                "--buzz-emoji-picker-category-icon-size": "14px",
+                "--buzz-emoji-picker-fade-height": "0px",
+                "--buzz-emoji-picker-fade-opacity": "0",
+                "--buzz-emoji-picker-nav-button-size": "24px",
+                "--buzz-emoji-picker-nav-padding-x": "8px",
+                "--buzz-emoji-picker-padding": "8px",
+                "--buzz-emoji-picker-scroll-padding-top": "0px",
+                "--buzz-emoji-picker-search-control-height": "40px",
+              }
+            : null),
       }) as React.CSSProperties,
     [documentEmojiMartThemeVars, emojiPickerThemeVars, presentation],
   );
@@ -143,6 +160,10 @@ export function ProfileAvatarEditor({
     [customHue, customSaturation, customValue],
   );
   const isOnboardingModal = presentation === "onboarding-modal";
+  const isOnboardingInline = presentation === "onboarding-inline";
+  useSmoothCorners(emojiPickerContainerRef, {
+    enabled: isOnboardingInline && mode === "emoji",
+  });
   const shouldShowColorControls =
     mode === "emoji" &&
     (selectedEmoji !== null || showEmojiColorControlsWhenEmpty);
@@ -161,14 +182,15 @@ export function ProfileAvatarEditor({
     },
     [mode, onModeChange],
   );
+  const setAvatar = useAvatarSelection(avatarUrl, onUrlChange);
   const handleUploadSuccess = React.useCallback(
     (uploadedUrl: string) => {
       setUrlDraft("");
       onUploadedAvatarChange?.(uploadedUrl);
-      onUrlChange(uploadedUrl);
+      setAvatar(uploadedUrl);
       updateMode("image");
     },
-    [onUploadedAvatarChange, onUrlChange, updateMode],
+    [onUploadedAvatarChange, setAvatar, updateMode],
   );
   const [isAnimatedApplyPending, setIsAnimatedApplyPending] =
     React.useState(false);
@@ -192,14 +214,14 @@ export function ProfileAvatarEditor({
       clearUploadError();
       setUrlDraft("");
       onUploadedAvatarChange?.(animatedUrl);
-      onUrlChange(animatedUrl);
+      setAvatar(animatedUrl);
       onAnimatedAvatarApply?.(animatedUrl);
     },
     [
       clearUploadError,
       onAnimatedAvatarApply,
       onUploadedAvatarChange,
-      onUrlChange,
+      setAvatar,
     ],
   );
   // Done on the animated tab uploads the pending recording first, then
@@ -250,7 +272,11 @@ export function ProfileAvatarEditor({
     onDone?.();
   }, [isAnimatedDoneQueued, onDone]);
 
-  useEmojiMartStyles(emojiPickerContainerRef, mode === "emoji");
+  useEmojiMartStyles(
+    emojiPickerContainerRef,
+    mode === "emoji",
+    isOnboardingInline,
+  );
 
   React.useEffect(() => {
     if (mode !== "emoji") return;
@@ -347,14 +373,14 @@ export function ProfileAvatarEditor({
     }
 
     onUploadedAvatarChange?.(null);
-    onUrlChange(nextAvatarUrl);
+    setAvatar(nextAvatarUrl);
   }, [
     avatarUrl,
     customColorDraft,
     isCustomColorPickerOpen,
     onUploadedAvatarChange,
-    onUrlChange,
     selectedEmoji,
+    setAvatar,
   ]);
 
   const handleFiles = React.useCallback(
@@ -379,14 +405,14 @@ export function ProfileAvatarEditor({
 
     clearUploadError();
     onUploadedAvatarChange?.(null);
-    onUrlChange(nextUrl);
+    setAvatar(nextUrl);
     hasUserEditedUrlDraftRef.current = false;
     updateMode("image");
   }, [
     clearUploadError,
     isInputDisabled,
     onUploadedAvatarChange,
-    onUrlChange,
+    setAvatar,
     updateMode,
     urlDraft,
   ]);
@@ -396,10 +422,10 @@ export function ProfileAvatarEditor({
       setUrlDraft("");
       hasUserEditedUrlDraftRef.current = false;
       onUploadedAvatarChange?.(null);
-      onUrlChange(emojiAvatarDataUrl(emoji, color));
+      setAvatar(emojiAvatarDataUrl(emoji, color));
       onEmojiAvatarChange?.();
     },
-    [onEmojiAvatarChange, onUploadedAvatarChange, onUrlChange, selectedColor],
+    [onEmojiAvatarChange, onUploadedAvatarChange, selectedColor, setAvatar],
   );
 
   const openCustomColorPicker = React.useCallback(() => {
@@ -500,7 +526,11 @@ export function ProfileAvatarEditor({
     <fieldset
       className={cn(
         "mx-auto w-full border-0 p-0 text-sm",
-        isOnboardingModal ? "max-w-[456px]" : "max-w-[576px]",
+        isOnboardingInline
+          ? "max-w-none md:ml-0 md:mr-auto"
+          : isOnboardingModal
+            ? "max-w-[456px] md:ml-0 md:mr-auto"
+            : "max-w-[576px]",
       )}
       data-testid={`${testIdPrefix}-editor`}
       disabled={isInputDisabled}
@@ -566,7 +596,9 @@ export function ProfileAvatarEditor({
         <div
           className={cn(
             "relative w-full",
-            isOnboardingModal ? "flex min-h-[inherit] flex-col" : "grid gap-4",
+            isOnboardingModal || isOnboardingInline
+              ? "flex min-h-[inherit] flex-col"
+              : "grid gap-4",
           )}
         >
           {modeTabsContent}
@@ -574,31 +606,50 @@ export function ProfileAvatarEditor({
           <div
             className={cn(
               "transition-[height] duration-[250ms] ease-out",
-              isOnboardingModal
-                ? cn(
-                    "flex min-h-0 flex-1 items-center overflow-visible",
-                    shouldShowColorControls && "py-6",
-                  )
-                : "overflow-hidden",
+              isOnboardingInline
+                ? mode === "emoji"
+                  ? "mt-3 flex h-[420px] min-h-0 items-center overflow-visible"
+                  : "mt-3 h-[420px] overflow-y-auto"
+                : isOnboardingModal
+                  ? cn(
+                      "flex min-h-0 flex-1 items-center overflow-visible",
+                      shouldShowColorControls && "py-6",
+                    )
+                  : "overflow-hidden",
             )}
             data-testid={`${testIdPrefix}-mode-content-shell`}
             style={
-              isOnboardingModal || modeContentHeight === null
+              isOnboardingModal ||
+              isOnboardingInline ||
+              modeContentHeight === null
                 ? undefined
                 : { height: modeContentHeight }
             }
           >
             <div
-              className={cn("overflow-visible", isOnboardingModal && "w-full")}
+              className={cn(
+                "overflow-visible",
+                (isOnboardingModal || isOnboardingInline) && "w-full",
+                isOnboardingInline && "h-full",
+              )}
               ref={modeContentRef}
             >
               {mode === "image" ? (
-                <div className="grid content-start gap-3">
+                <div
+                  className={cn(
+                    "grid content-start gap-3",
+                    isOnboardingInline &&
+                      "h-full grid-rows-[minmax(0,1fr)_4rem]",
+                  )}
+                >
                   <button
                     className={cn(
                       isOnboardingModal
                         ? "relative flex h-32 flex-col items-center justify-center overflow-hidden rounded-lg border border-dashed border-[color:rgb(var(--buzz-onboarding-avatar-control-fg)_/_0.7)] bg-transparent text-[rgb(var(--buzz-onboarding-avatar-control-fg))] transition-[background-color,border-color,box-shadow,color] duration-[250ms] ease-out hover:bg-[color:rgb(var(--buzz-onboarding-avatar-accent-bg)_/_0.18)] disabled:opacity-60"
-                        : "relative flex h-[120px] flex-col items-center justify-center gap-3 overflow-hidden rounded-xl border border-transparent bg-muted text-foreground transition-[background-color,border-color,box-shadow,color] duration-[250ms] ease-out hover:bg-muted/80 disabled:opacity-60",
+                        : cn(
+                            "relative flex flex-col items-center justify-center gap-3 overflow-hidden rounded-xl border border-transparent bg-muted text-foreground transition-[background-color,border-color,box-shadow,color] duration-[250ms] ease-out hover:bg-muted/80 disabled:opacity-60",
+                            isOnboardingInline ? "h-full" : "h-[120px]",
+                          ),
                       isImageDropActive &&
                         (isOnboardingModal
                           ? "border-[rgb(var(--buzz-onboarding-avatar-control-fg))] bg-[color:rgb(var(--buzz-onboarding-avatar-accent-bg)_/_0.24)]"
@@ -610,14 +661,6 @@ export function ProfileAvatarEditor({
                     onClick={openPicker}
                     type="button"
                   >
-                    {isOnboardingModal &&
-                    (localPreview.previewUrl || avatarUrl) ? (
-                      <ProfileAvatarUploadPreview
-                        avatarUrl={localPreview.previewUrl || avatarUrl || ""}
-                        label={previewName}
-                        testId={`${testIdPrefix}-upload-preview`}
-                      />
-                    ) : null}
                     <span
                       aria-hidden="true"
                       className={cn(
@@ -699,7 +742,7 @@ export function ProfileAvatarEditor({
                         hasUserEditedUrlDraftRef.current = true;
                         setUrlDraft(event.target.value);
                         onUploadedAvatarChange?.(null);
-                        onUrlChange(event.target.value);
+                        setAvatar(event.target.value);
                       }}
                       onFocus={() => {
                         isUrlInputFocusedRef.current = true;
@@ -743,15 +786,34 @@ export function ProfileAvatarEditor({
                   onPreviewCaptionChange={onAnimatedPreviewCaptionChange}
                   previewContainer={animatedPreviewContainer}
                   registerApply={registerAnimatedApply}
-                  autoStartCamera={isOnboardingModal}
                   compactReview={isOnboardingModal}
+                  compactColorPicker={compactCustomColorPicker}
                   showApplyButton={!onDone}
+                  stackCameraOptions={stackAnimatedCameraOptions}
                   testIdPrefix={testIdPrefix}
                 />
               ) : (
-                <div className="relative grid content-start gap-3">
+                <div
+                  className={cn(
+                    "relative grid content-start",
+                    isOnboardingInline
+                      ? cn(
+                          "h-full grid-rows-[minmax(0,1fr)_auto]",
+                          shouldShowColorControls ? "gap-2" : "gap-0",
+                        )
+                      : "gap-3",
+                  )}
+                >
                   <div
-                    className="buzz-emoji-mart relative z-0 h-[316px] overflow-hidden rounded-xl bg-muted transition-colors duration-[250ms] ease-out"
+                    className={cn(
+                      "buzz-emoji-mart relative z-0 overflow-hidden bg-muted transition-colors duration-[250ms] ease-out",
+                      isOnboardingInline
+                        ? "h-full min-h-0 rounded-2xl"
+                        : isOnboardingModal
+                          ? "h-[316px] rounded-xl"
+                          : "h-[384px] rounded-xl",
+                    )}
+                    data-testid={`${testIdPrefix}-emoji-picker`}
                     ref={emojiPickerContainerRef}
                     style={emojiMartThemeVars}
                   >
@@ -760,10 +822,14 @@ export function ProfileAvatarEditor({
                       data={emojiData}
                       dynamicWidth
                       emojiButtonRadius="999px"
-                      emojiButtonSize={isOnboardingModal ? 44 : 64}
-                      emojiSize={isOnboardingModal ? 28 : 48}
+                      emojiButtonSize={
+                        isOnboardingInline ? 72 : isOnboardingModal ? 44 : 64
+                      }
+                      emojiSize={
+                        isOnboardingInline ? 48 : isOnboardingModal ? 28 : 48
+                      }
                       icons="outline"
-                      navPosition="bottom"
+                      navPosition={isOnboardingInline ? "none" : "bottom"}
                       onEmojiSelect={(
                         emoji: { native?: string },
                         event?: MouseEvent,
@@ -778,7 +844,7 @@ export function ProfileAvatarEditor({
                           selectedEmoji === null
                             ? randomInitialEmojiAvatarColor()
                             : selectedColor;
-                        if (!isOnboardingModal) {
+                        if (!isOnboardingModal && !isOnboardingInline) {
                           burstEmoji(emoji.native, event);
                         }
                         setSelectedEmoji(emoji.native);
@@ -786,9 +852,9 @@ export function ProfileAvatarEditor({
                         applyEmojiAvatar(emoji.native, nextColor);
                       }}
                       previewPosition="none"
-                      searchPosition="none"
+                      searchPosition="sticky"
                       set="native"
-                      skinTonePosition="none"
+                      skinTonePosition="search"
                       theme={emojiPickerTheme}
                     />
                   </div>
@@ -800,7 +866,10 @@ export function ProfileAvatarEditor({
                         ? "overflow-hidden"
                         : "origin-top overflow-hidden transition-[max-height,margin,opacity,transform] duration-[250ms] ease-out",
                       shouldShowColorControls
-                        ? "mt-3 max-h-64 scale-100 opacity-100"
+                        ? cn(
+                            "max-h-64 scale-100 opacity-100",
+                            isOnboardingInline ? "mt-0" : "mt-3",
+                          )
                         : "mt-0 max-h-0 scale-[0.96] opacity-0",
                     )}
                     data-testid={`${testIdPrefix}-color-grid-shell`}
@@ -809,7 +878,11 @@ export function ProfileAvatarEditor({
                     <div
                       className={cn(
                         "grid grid-cols-8 justify-items-center rounded-xl bg-muted transition-colors duration-[250ms] ease-out",
-                        isOnboardingModal ? "gap-2 p-3" : "gap-3 p-4",
+                        isOnboardingInline
+                          ? "grid-cols-12 gap-1 p-2"
+                          : isOnboardingModal
+                            ? "gap-2 p-3"
+                            : "gap-3 p-4",
                       )}
                       data-testid={`${testIdPrefix}-color-grid`}
                     >
@@ -837,7 +910,11 @@ export function ProfileAvatarEditor({
                             aria-pressed={isSelected}
                             className={cn(
                               "relative scroll-mb-52 rounded-full border border-border transition-transform duration-200 ease-out hover:scale-[1.15] focus-visible:scale-[1.15] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                              isOnboardingModal ? "h-7 w-7" : "h-10 w-10",
+                              isOnboardingInline
+                                ? "h-5 w-5"
+                                : isOnboardingModal
+                                  ? "h-7 w-7"
+                                  : "h-10 w-10",
                               isCustomSwatch &&
                                 !selectedEmoji &&
                                 "cursor-not-allowed opacity-45 hover:scale-100 focus-visible:scale-100",
@@ -863,7 +940,9 @@ export function ProfileAvatarEditor({
                               <span
                                 className={cn(
                                   "absolute rounded-full border-[3px]",
-                                  isOnboardingModal ? "inset-0.5" : "inset-1",
+                                  isOnboardingModal || isOnboardingInline
+                                    ? "inset-0.5"
+                                    : "inset-1",
                                 )}
                                 style={{
                                   borderColor: contrastColorForBackground(
@@ -888,6 +967,7 @@ export function ProfileAvatarEditor({
                       setCustomValue(nextValue);
                     }}
                     saturation={customSaturation}
+                    compact={compactCustomColorPicker}
                     testIdPrefix={testIdPrefix}
                     value={customValue}
                     visible={isCustomColorPickerVisible}
