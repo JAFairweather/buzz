@@ -37,7 +37,7 @@ pub struct BlobDescriptor {
 }
 
 /// Build an `imeta` tag array from a BlobDescriptor (NIP-92 media metadata).
-pub fn build_imeta_tag(d: &BlobDescriptor) -> Vec<String> {
+pub fn build_imeta_tag(d: &BlobDescriptor, filename: Option<&str>) -> Vec<String> {
     let mut tag = vec![
         "imeta".to_string(),
         format!("url {}", d.url),
@@ -57,23 +57,33 @@ pub fn build_imeta_tag(d: &BlobDescriptor) -> Vec<String> {
     if let Some(dur) = d.duration {
         tag.push(format!("duration {dur}"));
     }
+    if let Some(filename) = filename {
+        tag.push(format!("filename {filename}"));
+    }
     tag
 }
 
-/// MIME types accepted for upload.
-const ALLOWED_MIMES: &[&str] = &[
-    "image/jpeg",
-    "image/png",
-    "image/gif",
-    "image/webp",
-    "video/mp4",
-];
+/// Image MIME types previewed inline by the relay.
+const IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 
 /// Maximum file size for image uploads (50 MB).
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Maximum file size for video uploads (500 MB).
 const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Default relay cap for generic files served as downloads.
+const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
+fn max_upload_bytes(mime: &str) -> u64 {
+    if mime == "video/mp4" {
+        MAX_VIDEO_BYTES
+    } else if IMAGE_MIMES.contains(&mime) {
+        MAX_IMAGE_BYTES
+    } else {
+        MAX_FILE_BYTES
+    }
+}
 
 /// Sign a NIP-98 HTTP auth event (kind:27235) and return the Authorization header value.
 ///
@@ -1220,16 +1230,10 @@ impl BuzzClient {
             .map(|t| t.mime_type().to_string())
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        if !ALLOWED_MIMES.contains(&mime.as_str()) {
-            return Err(CliError::Usage(format!("unsupported file type: {mime}")));
-        }
-
+        // The relay validates the sniffed bytes and serves non-media files as
+        // downloads. Keep the client cap aligned with its default file limit.
         // 3. Size check
-        let max = if mime.starts_with("video/") {
-            MAX_VIDEO_BYTES
-        } else {
-            MAX_IMAGE_BYTES
-        };
+        let max = max_upload_bytes(&mime);
         if bytes.len() as u64 > max {
             return Err(CliError::Usage(format!(
                 "file too large: {} bytes (max {})",
@@ -1243,7 +1247,7 @@ impl BuzzClient {
 
         // 5. PUT request to the BUD-02 /upload endpoint with a generous timeout.
         // Auth is signed per attempt — matches the per-attempt signing pattern in download_media.
-        let upload_timeout = if mime.starts_with("video/") {
+        let upload_timeout = if mime == "video/mp4" {
             Duration::from_secs(600)
         } else {
             Duration::from_secs(120)
@@ -1711,7 +1715,18 @@ mod retry_policy_tests {
     use tokio::net::TcpListener;
 
     use super::super::error::CliError;
-    use super::BuzzClient;
+    use super::{max_upload_bytes, BuzzClient};
+
+    #[test]
+    fn upload_size_limits_match_relay_defaults() {
+        assert_eq!(max_upload_bytes("image/png"), 50 * 1024 * 1024);
+        assert_eq!(max_upload_bytes("video/mp4"), 500 * 1024 * 1024);
+        assert_eq!(
+            max_upload_bytes("application/octet-stream"),
+            100 * 1024 * 1024
+        );
+        assert_eq!(max_upload_bytes("application/pdf"), 100 * 1024 * 1024);
+    }
 
     /// Spawn a one-shot axum server on a random port.  The handler `f` receives the
     /// attempt counter (incremented before every call) and returns a `(StatusCode,

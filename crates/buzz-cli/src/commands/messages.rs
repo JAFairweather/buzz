@@ -608,6 +608,37 @@ pub struct SendMessageParams {
     pub mentions: Vec<String>,
 }
 
+/// Keep the display name inside the relay's imeta filename rules.
+fn attachment_filename(file_path: &str) -> Option<&str> {
+    let name = std::path::Path::new(file_path).file_name()?.to_str()?;
+    if name.is_empty()
+        || name.len() > 255
+        || name
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn attachment_markdown(desc: &crate::client::BlobDescriptor, filename: Option<&str>) -> String {
+    if desc.mime_type == "video/mp4" {
+        format!("\n![video]({})", desc.url)
+    } else if matches!(
+        desc.mime_type.as_str(),
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    ) {
+        format!("\n![image]({})", desc.url)
+    } else {
+        let label = filename
+            .unwrap_or("file")
+            .replace('[', "\\[")
+            .replace(']', "\\]");
+        format!("\n[{label}]({})", desc.url)
+    }
+}
+
 pub async fn cmd_send_message(
     client: &BuzzClient,
     mut p: SendMessageParams,
@@ -655,14 +686,9 @@ pub async fn cmd_send_message(
             .upload_file(file_path)
             .await
             .map_err(|e| CliError::Other(format!("upload failed for {file_path}: {e}")))?;
-        media_tags.push(crate::client::build_imeta_tag(&desc));
-        if desc.mime_type.starts_with("video/") {
-            media_content.push_str("\n![video](");
-        } else {
-            media_content.push_str("\n![image](");
-        }
-        media_content.push_str(&desc.url);
-        media_content.push(')');
+        let filename = attachment_filename(file_path);
+        media_tags.push(crate::client::build_imeta_tag(&desc, filename));
+        media_content.push_str(&attachment_markdown(&desc, filename));
     }
     let final_content = if media_content.is_empty() {
         p.content.clone()
@@ -1718,6 +1744,109 @@ mod tests {
             files: vec![],
             mentions: vec![],
         }
+    }
+
+    #[test]
+    fn only_relay_inline_media_uses_inline_markdown() {
+        let mut desc: crate::client::BlobDescriptor = serde_json::from_value(json!({
+            "url": "https://relay.example/media/file.bin",
+            "sha256": "a".repeat(64),
+            "size": 4,
+            "type": "image/bmp",
+            "uploaded": 0
+        }))
+        .unwrap();
+        assert_eq!(
+            super::attachment_markdown(&desc, Some("diagram.bmp")),
+            "\n[diagram.bmp](https://relay.example/media/file.bin)"
+        );
+        desc.mime_type = "image/png".into();
+        assert_eq!(
+            super::attachment_markdown(&desc, Some("diagram.png")),
+            "\n![image](https://relay.example/media/file.bin)"
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_send_message_attaches_text_files_as_downloads() {
+        use sha2::Digest;
+        use std::io::Write;
+
+        let uploads = StdArc::new(AtomicU32::new(0));
+        let events: StdArc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            StdArc::new(std::sync::Mutex::new(Vec::new()));
+        type S = (
+            StdArc<AtomicU32>,
+            StdArc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        );
+        let state: S = (uploads.clone(), events.clone());
+        let app = AxumRouter::new()
+            .route(
+                "/upload",
+                axum::routing::put(
+                    |AxumState((count, _)): AxumState<S>,
+                     headers: AxumHeaderMap,
+                     body: AxumBytes| async move {
+                        assert_eq!(headers["content-type"], "application/octet-stream");
+                        count.fetch_add(1, Ordering::Relaxed);
+                        let hash = hex::encode(sha2::Sha256::digest(&body));
+                        axum::Json(json!({
+                            "url": format!("https://relay.example/media/{hash}.bin"),
+                            "sha256": hash,
+                            "size": body.len(),
+                            "type": "application/octet-stream",
+                            "uploaded": 0,
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/events",
+                axum_post(
+                    |AxumState((_, events)): AxumState<S>, body: AxumBytes| async move {
+                        events
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&body).unwrap());
+                        axum::Json(json!({"event_id": "fake0000", "accepted": true}))
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut txt = tempfile::Builder::new().suffix(".txt").tempfile().unwrap();
+        let mut md = tempfile::Builder::new().suffix(".md").tempfile().unwrap();
+        txt.write_all(b"plain text attachment").unwrap();
+        md.write_all(b"# Markdown attachment\n").unwrap();
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+        let mut params = send_params("Attached notes");
+        params.files = vec![
+            txt.path().to_string_lossy().into_owned(),
+            md.path().to_string_lossy().into_owned(),
+        ];
+        cmd_send_message(&client, params).await.unwrap();
+
+        assert_eq!(uploads.load(Ordering::Relaxed), 2);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        let content = event["content"].as_str().unwrap();
+        for file in [&txt, &md] {
+            let filename = file.path().file_name().unwrap().to_str().unwrap();
+            let filename_tag = format!("filename {filename}");
+            assert!(content.contains(&format!("[{filename}](https://relay.example/media/")));
+            assert!(event["tags"].as_array().unwrap().iter().any(|tag| {
+                tag.as_array().is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.as_str() == Some(filename_tag.as_str()))
+                })
+            }));
+        }
+        assert!(!content.contains("![image]") && !content.contains("![video]"));
     }
 
     #[tokio::test]
