@@ -140,6 +140,8 @@ jobs:
         run: scripts/test-mobile-worktree-overrides.sh
       - name: Codex security review contract
         run: just security-review-check
+      - name: rmcp transport boundary contract
+        run: scripts/test-rmcp-transport-boundary.sh
       - name: Rust cache contract
         run: |
           scripts/test-rust-cache-contract.sh
