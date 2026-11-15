@@ -623,9 +623,12 @@ fn attachment_filename(file_path: &str) -> Option<&str> {
 }
 
 fn attachment_markdown(desc: &crate::client::BlobDescriptor, filename: Option<&str>) -> String {
-    if desc.mime_type.starts_with("video/") {
+    if desc.mime_type == "video/mp4" {
         format!("\n![video]({})", desc.url)
-    } else if desc.mime_type.starts_with("image/") {
+    } else if matches!(
+        desc.mime_type.as_str(),
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    ) {
         format!("\n![image]({})", desc.url)
     } else {
         let label = filename
@@ -1741,6 +1744,27 @@ mod tests {
             files: vec![],
             mentions: vec![],
         }
+    }
+
+    #[test]
+    fn only_relay_inline_media_uses_inline_markdown() {
+        let mut desc: crate::client::BlobDescriptor = serde_json::from_value(json!({
+            "url": "https://relay.example/media/file.bin",
+            "sha256": "a".repeat(64),
+            "size": 4,
+            "type": "image/bmp",
+            "uploaded": 0
+        }))
+        .unwrap();
+        assert_eq!(
+            super::attachment_markdown(&desc, Some("diagram.bmp")),
+            "\n[diagram.bmp](https://relay.example/media/file.bin)"
+        );
+        desc.mime_type = "image/png".into();
+        assert_eq!(
+            super::attachment_markdown(&desc, Some("diagram.png")),
+            "\n![image](https://relay.example/media/file.bin)"
+        );
     }
 
     #[tokio::test]
