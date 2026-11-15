@@ -15,6 +15,18 @@ ignore = [
     # remove these when upstream catches up.
     { id = "RUSTSEC-2026-0194", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
+    # q-172 exceptions expire 2026-12-15. The Security job checks these dates.
+    # See docs/security/q172-dependency-exceptions.md for paths, reachability and exit criteria.
+    { id = "RUSTSEC-2026-0459", reason = "q-172; expires=2026-12-15; MeshLLM 0.76.2 pins rusqlite 0.40 and SQLite 3.53; local log database requires a crafted DB and WAL pair" },
+    { id = "RUSTSEC-2026-0462", reason = "q-172; expires=2026-12-15; buzz-agent rmcp 1.8 enables only child-process transport, not affected Streamable HTTP clients; 3.x API migration required" },
+    { id = "RUSTSEC-2024-0449", reason = "q-172; expires=2026-12-15; serde_yaml 0.9 has no maintained unsafe-libyaml upgrade; parser migration required" },
+    { id = "RUSTSEC-2026-0371", reason = "q-172; expires=2026-12-15; MeshLLM keyring path uses zbus 5; zbus 6 migration required; unmaintained crate, no reported exploit" },
+    { id = "RUSTSEC-2026-0370", reason = "q-172; expires=2026-12-15; MeshLLM keyring path uses zbus 5; zbus 6 migration required; unmaintained crate, no reported exploit" },
+    { id = "RUSTSEC-2026-0372", reason = "q-172; expires=2026-12-15; MeshLLM keyring path uses zbus 5; zbus 6 migration required; unmaintained crate, no reported exploit" },
+    { id = "RUSTSEC-2026-0367", reason = "q-172; expires=2026-12-15; MeshLLM 0.76.2 pins zip 8; Buzz and MeshLLM copy entries manually without archive extract APIs or permission restoration" },
+    { id = "RUSTSEC-2026-0368", reason = "q-172; expires=2026-12-15; MeshLLM 0.76.2 pins zip 8; Buzz and MeshLLM copy entries manually without archive extract APIs or symlink creation" },
+    { id = "RUSTSEC-2026-0369", reason = "q-172; expires=2026-12-15; MeshLLM 0.76.2 pins zip 8; Buzz and MeshLLM copy entries manually without archive extract APIs or symlink permission changes" },
+    { id = "RUSTSEC-2026-0429", reason = "q-172; expires=2026-12-15; MeshLLM 0.76.2 pins zip 8; Buzz and MeshLLM copy entries manually without archive extract APIs" },
 ]
 
 [licenses]
