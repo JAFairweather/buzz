@@ -30,6 +30,15 @@ require_literal '- "scripts/create-deployment-eligibility-predicate.jq"'
 require_literal '- "scripts/select-qualified-ci-run.jq"'
 require_literal '- "scripts/test-relay-image-eligibility-workflow.sh"'
 
+# PR builds may read the shared GHCR cache, but must not write it. The PR's
+# repository token may have no installation in the image owner's namespace.
+registry_cache_exports=$(grep -A1 'cache-to:' "$workflow" | grep 'type=registry' || true)
+[[ $(grep -c "github.event_name != 'pull_request'" <<<"$registry_cache_exports") -eq 2 ]] &&
+  ! grep -Fq 'github.event.pull_request.head.repo.full_name' <<<"$registry_cache_exports" || {
+  echo 'pull-request image jobs must not export registry caches' >&2
+  exit 1
+}
+
 # Main pushes may skip only paths Docker never sees. The push filter must be, in
 # order: "**", then directory exclusions that .dockerignore also excludes, then
 # the re-included image workflow. Any other entry, or another order, could stop
