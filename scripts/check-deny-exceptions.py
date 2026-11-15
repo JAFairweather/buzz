@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail the Security job when a q-172 cargo-deny exception expires."""
+"""Check the review deadline for q-172 cargo-deny exceptions."""
 
 import argparse
 import datetime as dt

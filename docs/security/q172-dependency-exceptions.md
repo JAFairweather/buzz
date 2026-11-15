@@ -1,6 +1,6 @@
 # q-172 dependency advisory exceptions
 
-Owner: Murphy's Law. Review by **2026-12-15**. The Security workflow fails after that date until the exceptions are removed or a reviewer approves a new date with fresh evidence. This is the `herd/0.5.28` base's root `Cargo.lock`; the desktop Tauri workspace has a separate lockfile and is outside this inventory.
+Owner: Murphy's Law. Review by **2026-12-15**. Run `python3 scripts/check-deny-exceptions.py` at each review; it fails after that date until the exceptions are removed or a reviewer approves a new date with fresh evidence. The current GitHub token cannot change the Security workflow, so CI does not enforce the date yet. This is the `herd/0.5.28` base's root `Cargo.lock`; the desktop Tauri workspace has a separate lockfile and is outside this inventory.
 
 The q-171 baseline found 44 `cargo-deny` error blocks in 18 crate/version pairs. Compatible lockfile updates remove 34 blocks. Ten advisory IDs remain as individually documented exceptions in `deny.toml`:
 

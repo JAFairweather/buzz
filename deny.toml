@@ -15,7 +15,7 @@ ignore = [
     # remove these when upstream catches up.
     { id = "RUSTSEC-2026-0194", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
-    # q-172 exceptions expire 2026-12-15. The Security job checks these dates.
+    # q-172 exceptions expire 2026-12-15. Run scripts/check-deny-exceptions.py.
     # See docs/security/q172-dependency-exceptions.md for paths, reachability and exit criteria.
     { id = "RUSTSEC-2026-0459", reason = "q-172; expires=2026-12-15; MeshLLM 0.76.2 pins rusqlite 0.40 and SQLite 3.53; local log database requires a crafted DB and WAL pair" },
     { id = "RUSTSEC-2026-0462", reason = "q-172; expires=2026-12-15; buzz-agent rmcp 1.8 enables only child-process transport, not affected Streamable HTTP clients; 3.x API migration required" },
