@@ -3,15 +3,17 @@
 # --buzz-acp-release installs it only when the digest matches one supplied separately at install time (Hive
 # buzz-acp-fork-release-deploy-route, My Dude, 14 Nov). The deploy branch is herd/0.5.28: upstream
 # desktop-v0.5.28, the release herd-cloud runs, plus reviewed fixes. Fork main is far older and is never released.
-# Run by hand from main; it never overwrites an existing release.
+# Run by hand from main; it never overwrites an existing release. Left empty, the commit input means the current
+# head of the deploy branch, which only takes guarded merges of reviewed PRs, so nobody has to type a SHA.
 name: buzz-acp fork release
 
 on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Full 40-hex SHA of a reviewed commit on herd/0.5.28
-        required: true
+        description: Full 40-hex SHA of a reviewed commit on herd/0.5.28 (leave empty for its current head)
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -29,17 +31,19 @@ jobs:
     permissions:
       contents: write
     env:
-      COMMIT: ${{ inputs.commit }}
+      COMMIT_INPUT: ${{ inputs.commit }}
       TARGET: x86_64-unknown-linux-musl
       DEPLOY_BRANCH: herd/0.5.28
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check the commit input
+        # Surrounding spaces are dropped (a pasted SHA often carries one); anything else must be 40 hex or empty.
         run: |
-          if ! printf '%s' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::error::commit must be a full 40-hex SHA"; exit 1
+          given=$(printf '%s' "$COMMIT_INPUT" | tr -d '[:space:]')
+          if [ -n "$given" ] && ! printf '%s' "$given" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::commit must be a full 40-hex SHA, or empty for the head of $DEPLOY_BRANCH"; exit 1
           fi
-          echo "TAG=buzz-acp-$COMMIT" >> "$GITHUB_ENV"
+          echo "GIVEN_COMMIT=$given" >> "$GITHUB_ENV"
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ env.DEPLOY_BRANCH }}
@@ -48,6 +52,10 @@ jobs:
       - name: Require a commit on the deploy branch, and no existing release for it
         run: |
           git fetch --no-tags origin "+refs/heads/$DEPLOY_BRANCH:refs/remotes/origin/$DEPLOY_BRANCH"
+          COMMIT=${GIVEN_COMMIT:-$(git rev-parse "refs/remotes/origin/$DEPLOY_BRANCH^{commit}")}
+          printf '%s' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::could not resolve a commit"; exit 1; }
+          [ -n "$GIVEN_COMMIT" ] || echo "commit input empty: using the head of $DEPLOY_BRANCH, $COMMIT"
+          TAG="buzz-acp-$COMMIT"
           git cat-file -e "$COMMIT^{commit}" || { echo "::error::$COMMIT is not in this repository"; exit 1; }
           git merge-base --is-ancestor "$COMMIT" "origin/$DEPLOY_BRANCH" || { echo "::error::$COMMIT is not on $DEPLOY_BRANCH"; exit 1; }
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -55,6 +63,7 @@ jobs:
           fi
           git checkout --detach "$COMMIT"
           test "$(git rev-parse HEAD)" = "$COMMIT"
+          { echo "COMMIT=$COMMIT"; echo "TAG=$TAG"; } >> "$GITHUB_ENV"
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - name: Install cross
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
