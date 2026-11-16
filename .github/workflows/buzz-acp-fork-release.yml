@@ -1,9 +1,9 @@
-# buzz-acp fork release: builds buzz-acp for herd-cloud from one reviewed commit on the deploy branch and
-# publishes it, with its SHA-256, as a GitHub release tagged with that commit. herd-infra's install-buzz-agents
-# --buzz-acp-release installs it only when the digest matches one supplied separately at install time (Hive
-# buzz-acp-fork-release-deploy-route, My Dude, 14 Nov). The deploy branch is herd/0.5.28: upstream
-# desktop-v0.5.28, the release herd-cloud runs, plus reviewed fixes. Fork main is far older and is never released.
-# Run by hand from main; it never overwrites an existing release.
+# buzz-acp fork release: builds buzz-acp and the buzz CLI for herd-cloud from one reviewed commit on the deploy
+# branch and publishes them, with their SHA-256 digests, as a GitHub release tagged with that commit. herd-infra's
+# install-buzz-agents (--buzz-acp-release / --buzz-cli-release) installs each binary only when its digest matches one
+# supplied separately at install time (Hive buzz-acp-fork-release-deploy-route, My Dude, 14 Nov; q-246, 16 Nov).
+# The deploy branch is herd/0.5.28: upstream desktop-v0.5.28, the release herd-cloud runs, plus reviewed fixes.
+# Fork main is never released directly. Run by hand from main; it never overwrites an existing release.
 name: buzz-acp fork release
 
 on:
@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   release:
-    name: Build and publish buzz-acp (x86_64 musl)
+    name: Build and publish buzz-acp and buzz (x86_64 musl)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -60,22 +60,32 @@ jobs:
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
         with:
           tool: cross@0.2.5
-      - name: Build buzz-acp
-        run: cross build --release --locked --target "$TARGET" -p buzz-acp
-      - name: Stage the binary and its digest
+      - name: Build buzz-acp and buzz CLI
+        run: cross build --release --locked --target "$TARGET" -p buzz-acp -p buzz-cli
+      - name: Stage the binaries and their digests
         run: |
           mkdir -p out
-          cp "target/$TARGET/release/buzz-acp" "out/buzz-acp-$TARGET"
           # Static means no program interpreter and no shared-library dependency. musl Rust builds are static-pie,
           # which file(1) reports as "static-pie linked", not "statically linked", so the ELF headers decide.
-          bin="out/buzz-acp-$TARGET"
-          file "$bin"
-          readelf -hW "$bin" | grep -q 'Machine:[[:space:]]*Advanced Micro Devices X86-64' || { echo "::error::buzz-acp is not an x86-64 ELF"; exit 1; }
-          if readelf -lW "$bin" | grep -q 'INTERP' || readelf -dW "$bin" | grep -q '(NEEDED)'; then
-            echo "::error::buzz-acp is not statically linked"; exit 1
-          fi
-          (cd out && sha256sum "buzz-acp-$TARGET" > "buzz-acp-$TARGET.sha256")
-          cat "out/buzz-acp-$TARGET.sha256"
+          for name in buzz-acp buzz; do
+            cp "target/$TARGET/release/$name" "out/$name-$TARGET"
+            bin="out/$name-$TARGET"
+            file "$bin"
+            readelf -hW "$bin" | grep -q 'Machine:[[:space:]]*Advanced Micro Devices X86-64' || { echo "::error::$name is not an x86-64 ELF"; exit 1; }
+            if readelf -lW "$bin" | grep -q 'INTERP' || readelf -dW "$bin" | grep -q '(NEEDED)'; then
+              echo "::error::$name is not statically linked"; exit 1
+            fi
+          done
+          acp_help=$("out/buzz-acp-$TARGET" --help 2>&1)
+          grep -q EXIT_AFTER_INACTIVITY <<< "$acp_help" || { echo "::error::buzz-acp failed --help self-check"; exit 1; }
+          cli_help=$("out/buzz-$TARGET" --help 2>&1)
+          cli_send=$("out/buzz-$TARGET" messages send --help 2>&1)
+          grep -q '^Buzz CLI — interact with a Buzz relay$' <<< "$cli_help" || { echo "::error::buzz failed --help self-check"; exit 1; }
+          grep -q -- '--mention' <<< "$cli_send" || { echo "::error::buzz messages send failed --help self-check"; exit 1; }
+          for name in buzz-acp buzz; do
+            (cd out && sha256sum "$name-$TARGET" > "$name-$TARGET.sha256")
+            cat "out/$name-$TARGET.sha256"
+          done
       - name: Pin the tag to this commit before publishing
         # gh release create --target only applies when the tag does not exist yet (Murphy on PR 6), so the tag is
         # settled first: an existing tag must already name exactly $COMMIT, otherwise this run creates it there.
@@ -103,9 +113,10 @@ jobs:
       - name: Publish the release
         run: |
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "buzz-acp at ${COMMIT:0:12}" \
-            --notes "buzz-acp ($TARGET), built from $COMMIT on $DEPLOY_BRANCH by run $GITHUB_RUN_ID. Install only with herd-infra install-buzz-agents --buzz-acp-release and a digest checked separately." \
-            "out/buzz-acp-$TARGET" "out/buzz-acp-$TARGET.sha256"
+            --title "buzz-acp and buzz at ${COMMIT:0:12}" \
+            --notes "buzz-acp and buzz ($TARGET), built from $COMMIT on $DEPLOY_BRANCH by run $GITHUB_RUN_ID. Install only with herd-infra install-buzz-agents (--buzz-acp-release / --buzz-cli-release) and digests checked separately." \
+            "out/buzz-acp-$TARGET" "out/buzz-acp-$TARGET.sha256" \
+            "out/buzz-$TARGET" "out/buzz-$TARGET.sha256"
       - name: Check the release tag still names exactly this commit
         run: |
           obj=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" \
