@@ -85,6 +85,27 @@ test("matches the first mention in a parenthesized team expansion", () => {
   );
 });
 
+test("matches @mention in markdown formatting and table cells (#720)", () => {
+  const patterns = buildHighlightPatterns(["Kerouac", "My Dude"], []);
+  const matches = findHighlightMatches(
+    "| **@Kerouac** | _@My Dude_ |@Kerouac| ~~@Kerouac~~",
+    patterns,
+  );
+  assert.deepEqual(
+    matches.map((match) => match.match),
+    ["@Kerouac", "@My Dude", "@Kerouac", "@Kerouac"],
+  );
+});
+
+test("does not match @mention after word underscore", () => {
+  const patterns = buildHighlightPatterns(["Kerouac"], []);
+  assert.equal(findHighlightMatches("foo_@Kerouac", patterns).length, 0);
+  assert.deepEqual(
+    findHighlightMatches("word**@Kerouac**", patterns).map((m) => m.match),
+    ["@Kerouac"],
+  );
+});
+
 test("does not match @mention embedded in a word", () => {
   const patterns = buildHighlightPatterns(["bob"], []);
   const matches = findHighlightMatches("email@bob.com", patterns);

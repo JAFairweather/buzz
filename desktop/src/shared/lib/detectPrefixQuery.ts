@@ -22,21 +22,35 @@ export function detectPrefixQuery(
   const beforeCursor = value.slice(0, cursorPosition);
 
   // A prefix only triggers a query when it opens a "word" — i.e. it sits at the
-  // start of the text or right after whitespace or an opening bracket. Opening
-  // brackets are included so `(#channel`, `[@name`, `{#chan` all autocomplete
-  // the same as ` #channel` (previously only whitespace/start counted, so a
-  // prefix glued to a `(` never fired). Keep the two detection paths below in
-  // sync with this single definition of "boundary before the prefix".
-  const isBoundaryChar = (ch: string) => /[\s([{]/.test(ch);
+  // start of the text or right after whitespace, an opening bracket/quote/pipe,
+  // or markdown emphasis delimiters (`*`, `~`, `_`). Keep the two detection
+  // paths below in sync with this single definition of "boundary before the prefix".
+  const isOpenerChar = (ch: string) => /[\s([{<>"'|*~]/.test(ch);
+  const hasBoundaryBefore = (index: number): boolean => {
+    if (index === 0) return true;
+    const prev = beforeCursor[index - 1];
+    if (isOpenerChar(prev)) return true;
+    if (prev === "_") {
+      let u = index - 1;
+      while (u > 0 && beforeCursor[u - 1] === "_" && index - u < 3) {
+        u -= 1;
+      }
+      if (u > 0 && beforeCursor[u - 1] === "_") return false;
+      return u === 0 || isOpenerChar(beforeCursor[u - 1]);
+    }
+    return false;
+  };
 
   // Fast path: single-word query (no spaces after the prefix)
   const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const simplePattern = new RegExp(`(?:^|[\\s([{])${escapedPrefix}([^\\s]*)$`);
+  const simplePattern = new RegExp(`${escapedPrefix}([^\\s]*)$`);
   const simpleMatch = beforeCursor.match(simplePattern);
   if (simpleMatch) {
     const query = simpleMatch[1];
     const startIndex = beforeCursor.length - query.length - 1; // -1 for prefix
-    return { query, startIndex };
+    if (hasBoundaryBefore(startIndex)) {
+      return { query, startIndex };
+    }
   }
 
   // Multi-word path: scan backwards for the prefix and check if the text between
@@ -45,8 +59,8 @@ export function detectPrefixQuery(
   for (let i = beforeCursor.length - 1; i >= scanStart; i--) {
     const ch = beforeCursor[i];
     if (ch === prefix) {
-      // Ensure prefix is at start or preceded by whitespace/opening bracket
-      if (i > 0 && !isBoundaryChar(beforeCursor[i - 1])) {
+      // Ensure prefix is at start or preceded by a valid boundary
+      if (!hasBoundaryBefore(i)) {
         continue;
       }
       const candidate = beforeCursor.slice(i + 1);

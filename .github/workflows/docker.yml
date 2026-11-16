@@ -214,9 +214,9 @@ jobs:
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           cache-from: |
             type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
-          # PRs build without publishing; only push and dispatch runs export to GHCR.
-          cache-to: |
-            ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
+          # Pull requests may read the registry cache; only publish events update it.
+          # A same-repository PR in a fork cannot write the upstream package namespace.
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
 
       - name: Build and push debug image by digest
         id: build-debug

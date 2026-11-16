@@ -12,7 +12,7 @@ function escapeRegExp(str: string): string {
 export function mentionLabelPattern(label: string): string {
   const qualification = `(?! \\([0-9a-f]{64}\\))`;
   const suffix = / \([0-9a-f]{64}\)$/i.test(label)
-    ? `(?! (?:[2-9]|[1-9][0-9]+)(?=[\\s,;.!?:)\\]}*_]|$))`
+    ? `(?! (?:[2-9]|[1-9][0-9]+)(?=\\|\\||_(?=[\\s,;.!?:)\\]}>"'*_~|]|$)|_{2,3}|[\\s,;.!?:)\\]}>"'*~|]|$))`
     : "";
   return `${escapeRegExp(label)}${qualification}${suffix}`;
 }
@@ -155,7 +155,7 @@ function maskMarkdownCode(text: string): string {
 export function getMentionOffsets(text: string, name: string): number[] {
   const escaped = mentionLabelPattern(name);
   const pattern = new RegExp(
-    `(^|\\s|\\(|[*_]{1,3}|\\|\\|)(@${escaped})(?=\\|\\||[\\s,;.!?:)\\]}*_]|$)`,
+    `(^|(?:^|[\\s([{<>"'|*~])_{1,3}|[*~]{1,3}|[\\s([{<>"'|]|\\|\\|)(@${escaped})(?=\\|\\||_(?=[\\s,;.!?:)\\]}>"'*_~|]|$)|_{2,3}|[\\s,;.!?:)\\]}>"'*~|]|$)`,
     "gi",
   );
   const maskedText = maskMarkdownCode(text);
