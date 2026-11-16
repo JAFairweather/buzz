@@ -656,13 +656,7 @@ pub async fn cmd_send_message(
             .await
             .map_err(|e| CliError::Other(format!("upload failed for {file_path}: {e}")))?;
         media_tags.push(crate::client::build_imeta_tag(&desc));
-        if desc.mime_type.starts_with("video/") {
-            media_content.push_str("\n![video](");
-        } else {
-            media_content.push_str("\n![image](");
-        }
-        media_content.push_str(&desc.url);
-        media_content.push(')');
+        media_content.push_str(&attachment_markdown(&desc));
     }
     let final_content = if media_content.is_empty() {
         p.content.clone()
@@ -1078,6 +1072,90 @@ pub async fn dispatch(
         MessagesCmd::Vote { event, direction } => {
             cmd_vote_on_post(client, &event, &direction).await
         }
+    }
+}
+
+/// The body line for one uploaded attachment, in Desktop's format: `![image](url)` or
+/// `![video](url)` for media, and a plain `[filename](url)` link for any other file so it renders
+/// as a download card rather than a broken image. Link-label metacharacters are escaped.
+fn attachment_markdown(desc: &crate::client::BlobDescriptor) -> String {
+    if desc.mime_type.starts_with("video/") {
+        return format!("\n![video]({})", desc.url);
+    }
+    if desc.mime_type.starts_with("image/") {
+        return format!("\n![image]({})", desc.url);
+    }
+    let label = desc
+        .filename
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .or_else(|| desc.url.rsplit('/').next())
+        .unwrap_or("file");
+    let mut escaped = String::with_capacity(label.len());
+    for c in label.chars() {
+        if matches!(c, '\\' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    format!("\n[{escaped}]({})", desc.url)
+}
+
+#[cfg(test)]
+mod attachment_markdown_tests {
+    use super::attachment_markdown;
+    use crate::client::BlobDescriptor;
+
+    fn desc(mime: &str, url: &str, filename: Option<&str>) -> BlobDescriptor {
+        let mut d: BlobDescriptor = serde_json::from_value(serde_json::json!({
+            "url": url, "sha256": "ab", "size": 1, "type": mime, "uploaded": 0
+        }))
+        .unwrap();
+        d.filename = filename.map(str::to_string);
+        d
+    }
+
+    #[test]
+    fn media_stays_inline() {
+        assert_eq!(
+            attachment_markdown(&desc("image/png", "https://r/media/a.png", Some("a.png"))),
+            "\n![image](https://r/media/a.png)"
+        );
+        assert_eq!(
+            attachment_markdown(&desc("video/mp4", "https://r/media/a.mp4", None)),
+            "\n![video](https://r/media/a.mp4)"
+        );
+    }
+
+    #[test]
+    fn generic_file_is_a_labelled_link_not_an_image() {
+        // q-121: every non-video file used to render as `![image](...)`.
+        assert_eq!(
+            attachment_markdown(&desc(
+                "application/octet-stream",
+                "https://r/media/ab.bin",
+                Some("notes.md")
+            )),
+            "\n[notes.md](https://r/media/ab.bin)"
+        );
+        assert_eq!(
+            attachment_markdown(&desc("application/pdf", "https://r/media/ab.pdf", None)),
+            "\n[ab.pdf](https://r/media/ab.pdf)"
+        );
+    }
+
+    #[test]
+    fn link_label_metacharacters_are_escaped() {
+        assert_eq!(
+            attachment_markdown(&desc(
+                "application/octet-stream",
+                "https://r/media/ab.bin",
+                Some(r"a]b[c\d.txt")
+            )),
+            r"
+[a\]b\[c\\d.txt](https://r/media/ab.bin)"
+        );
     }
 }
 
