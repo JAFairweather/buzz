@@ -566,7 +566,7 @@ export function buildHighlightPatterns(
     );
     patterns.push(
       new RegExp(
-        `(?:^|(?<=[\\s(]))@(${escapedNames.join("|")})(?=\\W|$)`,
+        `(?:^|(?<=[\\s([{<>"'|*~])|(?<=(?:^|[\\s([{<>"'|*~])_{1,3}))@(${escapedNames.join("|")})(?=\\W|_(?:[\\W_]|$)|$)`,
         "gi",
       ),
     );
@@ -611,10 +611,26 @@ export function selectionAfterMentionTrailingSpace(
   // A multi-word name's internal spaces are not trailing separators.
   const lookbehind = Math.min(
     pos,
-    names.reduce((max, name) => Math.max(max, name.length + 2), 80),
+    names.reduce((max, name) => Math.max(max, name.length + 6), 80),
   );
   const before = doc.textBetween(pos - lookbehind, pos, "\n", "\0");
   const lower = before.toLowerCase();
+  const isPrefixOpener = (ch: string) => /[\s([{<>"'|*~]/.test(ch);
+  const hasPrefixBoundary = (index: number): boolean => {
+    if (index < 0) return false;
+    if (index === 0) return true;
+    const prev = before[index - 1];
+    if (isPrefixOpener(prev)) return true;
+    if (prev === "_") {
+      let u = index - 1;
+      while (u > 0 && before[u - 1] === "_" && index - u < 3) {
+        u -= 1;
+      }
+      if (u > 0 && before[u - 1] === "_") return false;
+      return u === 0 || isPrefixOpener(before[u - 1]);
+    }
+    return false;
+  };
   // Don't treat the space inside a registered multi-word label as the end of
   // a single-word token, even when the browser maps the caret there.
   const internalSpace = names.some((name) => {
@@ -625,8 +641,7 @@ export function selectionAfterMentionTrailingSpace(
       space = token.indexOf(" ", space + 1)
     ) {
       const start = before.length - space - 1;
-      if (start < 0 || (start > 0 && !/[\s(]/.test(before[start - 1])))
-        continue;
+      if (!hasPrefixBoundary(start)) continue;
       if (before[start] !== "@" && before[start] !== "#") continue;
       if (lower.slice(start + 1) !== token.slice(0, space)) continue;
       if (
@@ -647,13 +662,18 @@ export function selectionAfterMentionTrailingSpace(
   const knownBoundary = names.some((name) => {
     const start = before.length - name.length - 1;
     return (
-      start >= 0 &&
-      (start === 0 || /[\s(]/.test(before[start - 1])) &&
+      hasPrefixBoundary(start) &&
       (before[start] === "@" || before[start] === "#") &&
       lower.slice(start + 1) === name.toLowerCase()
     );
   });
-  if (!knownBoundary && !/(?:^|[\s(])[@#][^\s]+$/.test(before)) return pos;
+  const singleToken = /[@#][^\s]+$/.exec(before);
+  if (
+    !knownBoundary &&
+    (!singleToken || !hasPrefixBoundary(singleToken.index))
+  ) {
+    return pos;
+  }
   return pos + 1;
 }
 

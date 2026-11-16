@@ -1618,6 +1618,10 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(resolved, vec![PK_VALID_A, PK_VALID_B]);
+
+        let formatted_names =
+            extract_at_mentions_with_known("| **@Will Pfleger** | _@Alice_ |", &known_refs);
+        assert_eq!(formatted_names, vec!["will pfleger", "alice"]);
     }
 
     #[test]

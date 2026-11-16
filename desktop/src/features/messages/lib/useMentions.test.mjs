@@ -78,6 +78,32 @@ test("matches @Name at the end of spoiler content", () => {
   assert.equal(hasMention("||hi @Alice||", "Alice"), true);
 });
 
+test("matches @Name in markdown table and bold table cells (#720)", () => {
+  assert.equal(hasMention("| **@Kerouac** |", "Kerouac"), true);
+  assert.equal(hasMention("|**@Kerouac**|", "Kerouac"), true);
+  assert.equal(hasMention("|@Kerouac|", "Kerouac"), true);
+  assert.equal(hasMention("| @Kerouac|", "Kerouac"), true);
+  assert.equal(hasMention("| **@My Dude** |", "My Dude"), true);
+  assert.deepEqual(getMentionOffsets("|@Alice|@Alice|", "Alice"), [1, 8]);
+});
+
+test("matches @Name inside strikethrough, brackets, and quotes", () => {
+  assert.equal(hasMention("~~@Alice~~", "Alice"), true);
+  assert.equal(hasMention("[@Alice]", "Alice"), true);
+  assert.equal(hasMention('"@Alice"', "Alice"), true);
+  assert.equal(hasMention("'@Alice'", "Alice"), true);
+  assert.equal(hasMention(">@Alice", "Alice"), true);
+});
+
+test("keeps adjacent * and ~ formatting while excluding foo_@Name", () => {
+  assert.equal(hasMention("word**@Alice**", "Alice"), true);
+  assert.deepEqual(getMentionOffsets("word**@Alice**", "Alice"), [6]);
+  assert.equal(hasMention("word~~@Alice~~", "Alice"), true);
+  assert.equal(hasMention("**_@Alice_**", "Alice"), true);
+  assert.equal(hasMention("foo_@Alice", "Alice"), false);
+  assert.equal(hasMention("foo__@Alice__", "Alice"), false);
+});
+
 // ── Boundary conditions ───────────────────────────────────────────────
 
 test("matches @Name followed by punctuation", () => {
