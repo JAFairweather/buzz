@@ -217,12 +217,14 @@ impl ActionSink for RelayActionSink {
         may_direct_agents: bool,
         author_pubkey: &str,
         reply_to: Option<&str>,
+        recipient_pubkey: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<SentMessage, ActionSinkError>> + Send + '_>> {
         let channel_id = channel_id.to_owned();
         let text = text.to_owned();
         let authored_text = authored_text.to_owned();
         let author_pubkey = author_pubkey.to_owned();
         let reply_to = reply_to.map(str::to_owned);
+        let recipient_pubkey = recipient_pubkey.map(str::to_owned);
 
         Box::pin(async move {
             // 0. Upgrade weak reference — fails only during shutdown.
@@ -350,6 +352,30 @@ impl ActionSink for RelayActionSink {
                 Tag::parse(["buzz:workflow-owner", &author_pubkey_hex])
                     .map_err(|e| ActionSinkError::EventBuild(format!("workflow owner tag: {e}")))?,
             ];
+
+            if let Some(recipient_hex) = recipient_pubkey {
+                let recipient = nostr::PublicKey::from_hex(&recipient_hex).map_err(|e| {
+                    ActionSinkError::InvalidInput(format!("invalid recipient pubkey: {e}"))
+                })?;
+                let recipient_bytes = recipient.to_bytes();
+                if !state
+                    .is_member_cached(tenant.community(), channel_uuid, &recipient_bytes)
+                    .await
+                    .map_err(|e| ActionSinkError::Database(e.to_string()))?
+                {
+                    return Err(ActionSinkError::InvalidInput(
+                        "approval recipient is not a channel member".into(),
+                    ));
+                }
+                // The owner attribution tag is marked `owner` and does not
+                // notify. An approval addressed to the workflow owner still
+                // needs a separate plain p tag to reach its approver.
+                tags.push(
+                    Tag::parse(["p", &recipient.to_hex()]).map_err(|e| {
+                        ActionSinkError::EventBuild(format!("recipient p tag: {e}"))
+                    })?,
+                );
+            }
 
             // Resolve thread ancestry when this is a threaded reply, so the
             // built event carries NIP-10 `root`/`reply` e-tags and persists real
@@ -847,7 +873,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod postgres_tests {
+pub(crate) mod postgres_tests {
     //! Regression test for `e3661764` / `7899c1a8`: a workflow `send_message`
     //! that mentions a channel member by name (`@Name`) in its author-written
     //! step template must emit both the legacy `p` tag and authenticated
@@ -862,7 +888,7 @@ mod postgres_tests {
     use std::sync::Arc;
 
     /// Real-PG state mirroring `handlers::event::tests::test_state_with_redis_url`.
-    async fn test_state() -> Arc<AppState> {
+    pub(crate) async fn test_state() -> Arc<AppState> {
         test_state_with_agent_mentions(buzz_workflow::AgentMentions::Any).await
     }
 
@@ -1232,6 +1258,47 @@ mod postgres_tests {
             tag_values(&injected, "buzz:workflow-mention").is_empty(),
             "a mention introduced solely by trigger data must not receive owner-delegated authority"
         );
+
+        let notice_id = RelayActionSink::new(&state)
+            .send_message(
+                community,
+                &channel.id.to_string(),
+                "Approval requested",
+                "Approval requested",
+                false,
+                &author_hex,
+                None,
+                Some(&agent_hex),
+            )
+            .await
+            .expect("send approval notice")
+            .event_id;
+        let notice = load_event(&notice_id).await;
+        assert!(tag_values(&notice, "p").contains(&agent_hex));
+
+        let owner_notice_id = RelayActionSink::new(&state)
+            .send_message(
+                community,
+                &channel.id.to_string(),
+                "Approval requested from owner",
+                "Approval requested from owner",
+                false,
+                &author_hex,
+                None,
+                Some(&author_hex),
+            )
+            .await
+            .expect("send owner approval notice")
+            .event_id;
+        let owner_notice = load_event(&owner_notice_id).await;
+        assert!(
+            owner_notice
+                .event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["p", author_hex.as_str()]),
+            "owner-as-approver must have a notifying plain p tag beside owner attribution"
+        );
     }
 
     #[tokio::test]
@@ -1280,6 +1347,7 @@ mod postgres_tests {
                 true,
                 &author_hex,
                 None,
+                None,
             )
             .await
             .expect("send root")
@@ -1295,6 +1363,7 @@ mod postgres_tests {
                 true,
                 &author_hex,
                 Some(&root_hex),
+                None,
             )
             .await
             .expect("send reply")
@@ -1441,6 +1510,7 @@ mod postgres_tests {
                 true,
                 &author_hex,
                 Some(&parent_hex),
+                None,
             )
             .await
             .expect("send reply")
@@ -1525,6 +1595,7 @@ mod postgres_tests {
                 true,
                 &author_hex,
                 Some(&root_only_parent_hex),
+                None,
             )
             .await
             .expect("send root-only reply")
@@ -1618,6 +1689,7 @@ mod postgres_tests {
                 true,
                 &agent_hex,
                 None,
+                None,
             )
             .await
             .expect_err("an agent's workflow must not post in a DM with a stranger");
@@ -1632,6 +1704,7 @@ mod postgres_tests {
             "hi",
             true,
             &agent_hex,
+            None,
             None,
         )
         .await
@@ -1679,6 +1752,7 @@ mod postgres_tests {
                 true,
                 &author_hex,
                 Some(&unknown),
+                None,
             )
             .await
             .expect_err("reply to a non-existent parent must fail");
@@ -1779,6 +1853,7 @@ mod postgres_tests {
                     true,
                     &author_hex,
                     Some(&parent),
+                    None,
                 )
                 .await
             }

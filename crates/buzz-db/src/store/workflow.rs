@@ -1307,6 +1307,47 @@ pub async fn update_approval_by_stored_hash(
     Ok(affected > 0)
 }
 
+/// Expire a bounded batch of overdue approvals and fail their waiting runs.
+/// The approval update wins the same pending-row race as grant and deny.
+pub async fn expire_pending_approvals(pool: &PgPool) -> Result<u64> {
+    let affected = sqlx::query(
+        r#"
+        WITH selected AS (
+            SELECT a.community_id, a.token
+            FROM workflow_approvals a
+            JOIN workflow_runs r
+              ON r.community_id = a.community_id AND r.id = a.run_id
+            WHERE a.status = 'pending'
+              AND a.expires_at <= NOW()
+              AND r.status IN ('waiting_approval', 'failed')
+            ORDER BY a.expires_at
+            LIMIT 1000
+            FOR UPDATE OF a SKIP LOCKED
+        ), expired AS (
+            UPDATE workflow_approvals a
+            SET status = 'expired'
+            FROM selected s
+            WHERE a.community_id = s.community_id
+              AND a.token = s.token
+              AND a.status = 'pending'
+            RETURNING a.community_id, a.run_id
+        )
+        UPDATE workflow_runs r
+        SET status = 'failed',
+            error_message = 'approval expired',
+            completed_at = NOW()
+        FROM expired e
+        WHERE r.community_id = e.community_id
+          AND r.id = e.run_id
+          AND r.status = 'waiting_approval'
+        "#,
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected)
+}
+
 // -- Row mappers --------------------------------------------------------------
 
 fn row_to_workflow_record(row: sqlx::postgres::PgRow) -> Result<WorkflowRecord> {
@@ -1511,6 +1552,12 @@ impl Db {
         params: crate::workflow::CreateApprovalParams<'_>,
     ) -> Result<()> {
         crate::workflow::create_approval(&self.pool, params).await
+    }
+
+    /// Expire overdue approvals and fail their waiting runs.
+    #[datastore_span(name = "expire_pending_approvals", system = "postgresql")]
+    pub async fn expire_pending_approvals(&self) -> Result<u64> {
+        crate::workflow::expire_pending_approvals(&self.pool).await
     }
 
     /// Fetch an approval by raw token.
@@ -2711,6 +2758,64 @@ mod postgres_tests {
             "pruning below the largest interval breaks the DB anchor; \
              retention cutoff MUST exceed MAX(interval_secs) + safety margin (§5c)",
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn overdue_approval_fails_its_waiting_run() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+        let run_id = create_workflow_run(
+            &pool,
+            community,
+            workflow_id,
+            None,
+            None,
+            &RunCause::Schedule,
+        )
+        .await
+        .expect("create run");
+        update_workflow_run(
+            &pool,
+            community,
+            run_id,
+            RunStatus::WaitingApproval,
+            0,
+            &serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("wait for approval");
+        let token = Uuid::new_v4().to_string();
+        create_approval(
+            &pool,
+            CreateApprovalParams {
+                community_id: community,
+                token: &token,
+                workflow_id,
+                run_id,
+                step_id: "gate",
+                step_index: 0,
+                approver_spec: "any",
+                expires_at: Utc::now() - chrono::Duration::seconds(1),
+            },
+        )
+        .await
+        .expect("create overdue approval");
+
+        expire_pending_approvals(&pool)
+            .await
+            .expect("expire approvals");
+        let approval = get_approval(&pool, community, &token)
+            .await
+            .expect("read approval");
+        let run = get_workflow_run(&pool, community, run_id)
+            .await
+            .expect("read run");
+        assert_eq!(approval.status, ApprovalStatus::Expired);
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error_message.as_deref(), Some("approval expired"));
     }
 
     // -- Issue 4: workflow / approval community confinement -------------------

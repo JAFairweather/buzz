@@ -4006,6 +4006,22 @@ mod postgres_tests {
     };
     use nostr::{EventBuilder, Kind};
 
+    #[test]
+    fn user_signed_actor_tag_does_not_spoof_effective_author() {
+        let user = nostr::Keys::generate();
+        let relay = nostr::Keys::generate();
+        let forged_actor = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), "request")
+            .tags([nostr::Tag::parse(["actor", forged_actor]).expect("actor tag")])
+            .sign_with_keys(&user)
+            .expect("sign event");
+
+        assert_eq!(
+            effective_message_author(&event, &relay.public_key()),
+            user.public_key().to_bytes().to_vec()
+        );
+    }
+
     /// A channel lookup failure must deny the write. Before, the error became
     /// "no row", which skipped the archive check while a cached membership
     /// still authorized the write.

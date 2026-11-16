@@ -76,6 +76,7 @@ pub trait ActionSink: Send + Sync {
     /// - `reply_to`: when `Some(event_id_hex)`, the message is posted as a
     ///   threaded reply to that event (NIP-10 root/reply tags + real thread
     ///   metadata); when `None`, it is a top-level channel message.
+    /// - `recipient_pubkey`: optional exact channel member to notify.
     ///
     /// Returns the sent message on success.
     #[allow(clippy::too_many_arguments)]
@@ -88,5 +89,6 @@ pub trait ActionSink: Send + Sync {
         may_direct_agents: bool,
         author_pubkey: &str,
         reply_to: Option<&str>,
+        recipient_pubkey: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<SentMessage, ActionSinkError>> + Send + '_>>;
 }

@@ -462,7 +462,7 @@ pub fn resolve_step_templates(
             message,
             timeout,
         } => Ok(RequestApproval {
-            from: t(from)?,
+            from: from.clone(),
             message: t(message)?,
             timeout: timeout.clone(),
         }),
@@ -481,6 +481,10 @@ pub enum StepResult {
     Suspended {
         /// Token used to resume or reject this approval gate.
         approval_token: String,
+        /// Resolved prompt shown to the approver.
+        message: String,
+        /// Approval lifetime.
+        timeout: String,
     },
     /// Step was skipped due to `if:` condition being false.
     Skipped,
@@ -702,6 +706,7 @@ pub async fn dispatch_action(
                             withheld_reasons.is_empty(),
                             &owner_pubkey_hex,
                             reply_to,
+                            None,
                         )
                         .await
                         .map_err(WorkflowError::from)?;
@@ -818,11 +823,10 @@ pub async fn dispatch_action(
 
                     let token = generate_approval_token(run_id, step_id);
 
-                    // TODO (WF-08): create approval record in DB, emit kind:46010.
-                    // For now, return Suspended with the token so the caller can persist state.
-
                     Ok(StepResult::Suspended {
                         approval_token: token,
+                        message: message.clone(),
+                        timeout: timeout_str.to_owned(),
                     })
                 }
 
@@ -1118,13 +1122,24 @@ async fn add_reaction_impl(message_id: &str, emoji: &str) -> Result<JsonValue, W
 pub struct ExecutionResult {
     /// Set when execution suspended at a `RequestApproval` step.
     /// `None` means the run completed normally.
-    pub approval_token: Option<String>,
+    pub pending_approval: Option<PendingApproval>,
     /// Index of the step that suspended (or the total step count on completion).
     pub step_index: usize,
     /// Accumulated step outputs at the point of suspension or completion.
     pub step_outputs: HashMap<String, JsonValue>,
     /// Execution trace: one entry per completed/skipped step.
     pub trace: Vec<JsonValue>,
+}
+
+/// Resolved approval request returned by a suspended step.
+#[derive(Debug)]
+pub struct PendingApproval {
+    /// Random token presented to the designated approver.
+    pub token: String,
+    /// Prompt shown to the approver.
+    pub message: String,
+    /// Approval lifetime.
+    pub timeout: String,
 }
 
 /// Execute a workflow run sequentially.
@@ -1370,7 +1385,11 @@ async fn execute_steps(
                 }));
                 step_outputs.insert(step.id.clone(), output);
             }
-            StepResult::Suspended { approval_token } => {
+            StepResult::Suspended {
+                approval_token,
+                message,
+                timeout,
+            } => {
                 info!(
                     run_id = %run_id, step = %step.id,
                     "Step suspended — awaiting approval (token: <redacted>)"
@@ -1378,7 +1397,11 @@ async fn execute_steps(
                 // Return the token and current state so the caller can persist the
                 // approval record and update the run's execution trace.
                 return Ok(ExecutionResult {
-                    approval_token: Some(approval_token),
+                    pending_approval: Some(PendingApproval {
+                        token: approval_token,
+                        message,
+                        timeout,
+                    }),
                     step_index: i,
                     step_outputs,
                     trace,
@@ -1396,7 +1419,7 @@ async fn execute_steps(
 
     info!(run_id = %run_id, "Workflow run completed");
     Ok(ExecutionResult {
-        approval_token: None,
+        pending_approval: None,
         step_index: def.steps.len(),
         step_outputs,
         trace,
@@ -2099,7 +2122,7 @@ mod tests {
         )));
 
         for other in [
-            "  - id: approve\n    action: request_approval\n    from: '@manager'\n    message: ok?\n",
+            "  - id: approve\n    action: request_approval\n    from: any\n    message: ok?\n",
             "  - id: react\n    action: add_reaction\n    emoji: eyes\n",
             "  - id: dm\n    action: send_dm\n    to: '@manager'\n    text: hi\n",
             "  - id: topic\n    action: set_channel_topic\n    topic: hi\n",

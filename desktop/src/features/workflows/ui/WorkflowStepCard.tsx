@@ -97,8 +97,9 @@ function BackendSupportHint({ action }: { action: StepFormState["action"] }) {
     case "request_approval":
       return (
         <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-700">
-          Backend note: approval gates still stop runs with WF-08; approval
-          records are not persisted yet.
+          Approval requests pause the run. The approver responds with the CLI
+          command in the channel notice; the desktop approval card is not wired
+          yet.
         </p>
       );
     default:
@@ -311,7 +312,7 @@ function StepConfigFields({
               onChange={(event) =>
                 onUpdate({ ...step, from: event.target.value })
               }
-              placeholder="npub1…, hex pubkey, or role"
+              placeholder="Exact hex pubkey or any"
               value={step.from ?? ""}
             />
           </div>
