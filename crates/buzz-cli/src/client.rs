@@ -120,6 +120,9 @@ pub enum UploadKind {
 /// as `application/octet-stream`. Media types the relay has no validator for (other image
 /// formats, other video containers, audio) are refused, because the relay refuses them too.
 pub fn classify_upload(bytes: &[u8]) -> Result<(String, UploadKind, u64), CliError> {
+    // An ISO-BMFF container (`ftyp` at offset 4) with a brand `infer` does not know would
+    // otherwise pass as octet-stream; the relay refuses every such container off the video path.
+    let iso_bmff = bytes.len() >= 12 && &bytes[4..8] == b"ftyp";
     let mime = infer::get(bytes)
         .map(|t| t.mime_type().to_string())
         .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -129,6 +132,16 @@ pub fn classify_upload(bytes: &[u8]) -> Result<(String, UploadKind, u64), CliErr
         } else {
             (mime, UploadKind::Image, MAX_IMAGE_BYTES)
         });
+    }
+    if iso_bmff {
+        return Err(CliError::Usage(format!(
+            "unsupported file type: {}",
+            if mime == "application/octet-stream" {
+                "application/iso-bmff"
+            } else {
+                &mime
+            }
+        )));
     }
     if mime.starts_with("image/")
         || mime.starts_with("video/")
@@ -140,12 +153,23 @@ pub fn classify_upload(bytes: &[u8]) -> Result<(String, UploadKind, u64), CliErr
     Ok((mime, UploadKind::File, MAX_FILE_BYTES))
 }
 
+/// The relay's imeta `filename` bound, in UTF-8 bytes (`value.len() > 255` in buzz-relay
+/// handlers/imeta.rs).
+const MAX_FILENAME_BYTES: usize = 255;
+
 /// The display filename for a local path: its last component, without control characters,
-/// at most 255 characters, so it always passes the relay's imeta `filename` check. Mirrors
-/// Desktop's `sanitize_filename`.
+/// at most 255 UTF-8 bytes cut at a character boundary, so it always passes the relay's imeta
+/// `filename` check. Follows Desktop's `sanitize_filename`, except that Desktop counts
+/// characters, which lets a multibyte name exceed the relay's byte bound (Murphy, PR 19).
 pub fn upload_filename(path: &str) -> String {
     let base = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
-    let cleaned: String = base.chars().filter(|c| !c.is_control()).take(255).collect();
+    let mut cleaned = String::new();
+    for c in base.chars().filter(|c| !c.is_control()) {
+        if cleaned.len() + c.len_utf8() > MAX_FILENAME_BYTES {
+            break;
+        }
+        cleaned.push(c);
+    }
     if cleaned.is_empty() {
         "file".to_string()
     } else {
@@ -2609,6 +2633,50 @@ mod upload_kind_tests {
         assert_eq!(upload_filename("a\nb.txt"), "ab.txt");
         assert_eq!(upload_filename("dir/"), "file");
         assert_eq!(upload_filename(&"x".repeat(400)).chars().count(), 255);
+    }
+
+    #[test]
+    fn multibyte_filename_fits_the_relay_byte_bound_through_imeta() {
+        // Murphy, PR 19: 200 × 'é' is 200 chars but 400 bytes; the relay refuses imeta
+        // `filename` over 255 bytes, so a char cap let upload pass and `messages send` fail.
+        for name in [
+            "é".repeat(200),
+            "日本語".repeat(100),
+            format!("{}🙂.md", "a".repeat(253)),
+        ] {
+            let fname = upload_filename(&format!("/tmp/{name}"));
+            assert!(fname.len() <= 255, "{} bytes", fname.len());
+            assert!(
+                name.starts_with(&fname),
+                "cut must keep a prefix at a char boundary"
+            );
+            let d = BlobDescriptor {
+                filename: Some(fname),
+                ..serde_json::from_str(
+                    r#"{"url":"https://r.test/media/ab.bin","sha256":"ab","size":3,"type":"application/octet-stream","uploaded":0}"#,
+                )
+                .unwrap()
+            };
+            let tag = build_imeta_tag(&d);
+            let value = tag
+                .iter()
+                .find_map(|f| f.strip_prefix("filename "))
+                .unwrap();
+            assert!(
+                !value.is_empty() && value.len() <= 255,
+                "imeta filename {} bytes",
+                value.len()
+            );
+        }
+        assert_eq!(upload_filename(&"é".repeat(200)).len(), 254);
+    }
+
+    #[test]
+    fn unknown_iso_bmff_brand_is_refused_like_the_relay() {
+        let mut body = vec![0, 0, 0, 0x18];
+        body.extend_from_slice(b"ftypzzzz\0\0\0\0zzzz");
+        let err = classify_upload(&body).unwrap_err().to_string();
+        assert!(err.contains("unsupported file type"), "{err}");
     }
 
     #[test]
