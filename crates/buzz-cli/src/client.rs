@@ -34,6 +34,11 @@ pub struct BlobDescriptor {
     /// Duration in seconds for video/audio (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+    /// Original filename, set client-side after upload (the relay is content-addressed and
+    /// never returns it). Emitted as the imeta `filename` field so clients can label a
+    /// generic-file card, matching Desktop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
 }
 
 /// Build an `imeta` tag array from a BlobDescriptor (NIP-92 media metadata).
@@ -57,10 +62,13 @@ pub fn build_imeta_tag(d: &BlobDescriptor) -> Vec<String> {
     if let Some(dur) = d.duration {
         tag.push(format!("duration {dur}"));
     }
+    if let Some(ref name) = d.filename {
+        tag.push(format!("filename {name}"));
+    }
     tag
 }
 
-/// MIME types accepted for upload.
+/// Media MIME types accepted for upload; the relay runs its image/video validators on these.
 const ALLOWED_MIMES: &[&str] = &[
     "image/jpeg",
     "image/png",
@@ -69,11 +77,105 @@ const ALLOWED_MIMES: &[&str] = &[
     "video/mp4",
 ];
 
+/// Sniffed MIME types refused on the generic-file path. Mirrors the relay's
+/// `BLOCKED_FILE_MIME_TYPES` (buzz-media validation.rs) and Desktop's `BLOCKED_MIME`, so a
+/// file the relay would refuse fails here before any bytes are sent.
+const BLOCKED_FILE_MIMES: &[&str] = &[
+    "application/xhtml+xml",
+    "image/svg+xml",
+    "application/javascript",
+    "text/javascript",
+    "application/x-msdownload",
+    "application/x-executable",
+    "application/vnd.microsoft.portable-executable",
+    "application/x-mach-binary",
+    "application/x-sharedlib",
+    "application/x-elf",
+    "application/x-msi",
+    "application/vnd.android.package-archive",
+    "application/x-apple-diskimage",
+];
+
 /// Maximum file size for image uploads (50 MB).
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Maximum file size for video uploads (500 MB).
 const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Maximum file size for generic-file uploads (100 MB), the relay's default `max_file_bytes`.
+const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
+/// How an upload is admitted and rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadKind {
+    Image,
+    Video,
+    /// Any other file: documents, archives, and un-sniffable text such as Markdown, CSV or
+    /// source. The relay stores it byte-exact and always serves it as a download.
+    File,
+}
+
+/// Classify file bytes the way the relay's `/upload` does, returning the MIME to send and the
+/// size cap. Files with no magic signature (plain text, Markdown, JSON) are generic files sent
+/// as `application/octet-stream`. Media types the relay has no validator for (other image
+/// formats, other video containers, audio) are refused, because the relay refuses them too.
+pub fn classify_upload(bytes: &[u8]) -> Result<(String, UploadKind, u64), CliError> {
+    // An ISO-BMFF container (`ftyp` at offset 4) with a brand `infer` does not know would
+    // otherwise pass as octet-stream; the relay refuses every such container off the video path.
+    let iso_bmff = bytes.len() >= 12 && &bytes[4..8] == b"ftyp";
+    let mime = infer::get(bytes)
+        .map(|t| t.mime_type().to_string())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    if ALLOWED_MIMES.contains(&mime.as_str()) {
+        return Ok(if mime.starts_with("video/") {
+            (mime, UploadKind::Video, MAX_VIDEO_BYTES)
+        } else {
+            (mime, UploadKind::Image, MAX_IMAGE_BYTES)
+        });
+    }
+    if iso_bmff {
+        return Err(CliError::Usage(format!(
+            "unsupported file type: {}",
+            if mime == "application/octet-stream" {
+                "application/iso-bmff"
+            } else {
+                &mime
+            }
+        )));
+    }
+    if mime.starts_with("image/")
+        || mime.starts_with("video/")
+        || mime.starts_with("audio/")
+        || BLOCKED_FILE_MIMES.contains(&mime.as_str())
+    {
+        return Err(CliError::Usage(format!("unsupported file type: {mime}")));
+    }
+    Ok((mime, UploadKind::File, MAX_FILE_BYTES))
+}
+
+/// The relay's imeta `filename` bound, in UTF-8 bytes (`value.len() > 255` in buzz-relay
+/// handlers/imeta.rs).
+const MAX_FILENAME_BYTES: usize = 255;
+
+/// The display filename for a local path: its last component, without control characters,
+/// at most 255 UTF-8 bytes cut at a character boundary, so it always passes the relay's imeta
+/// `filename` check. Follows Desktop's `sanitize_filename`, except that Desktop counts
+/// characters, which lets a multibyte name exceed the relay's byte bound (Murphy, PR 19).
+pub fn upload_filename(path: &str) -> String {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path).trim();
+    let mut cleaned = String::new();
+    for c in base.chars().filter(|c| !c.is_control()) {
+        if cleaned.len() + c.len_utf8() > MAX_FILENAME_BYTES {
+            break;
+        }
+        cleaned.push(c);
+    }
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else {
+        cleaned
+    }
+}
 
 /// Sign a NIP-98 HTTP auth event (kind:27235) and return the Authorization header value.
 ///
@@ -1205,6 +1307,12 @@ impl BuzzClient {
     /// Upload a file to the relay's Blossom endpoint.
     /// Returns a BlobDescriptor on success.
     pub async fn upload_file(&self, file_path: &str) -> Result<BlobDescriptor, CliError> {
+        let mut desc = self.upload_file_bytes(file_path).await?;
+        desc.filename = Some(upload_filename(file_path));
+        Ok(desc)
+    }
+
+    async fn upload_file_bytes(&self, file_path: &str) -> Result<BlobDescriptor, CliError> {
         // 1. Read file — validate it exists and is a regular file
         let metadata = std::fs::metadata(file_path)
             .map_err(|e| CliError::Other(format!("cannot access {file_path}: {e}")))?;
@@ -1215,21 +1323,10 @@ impl BuzzClient {
         let bytes = std::fs::read(file_path)
             .map_err(|e| CliError::Other(format!("failed to read {file_path}: {e}")))?;
 
-        // 2. Detect MIME from magic bytes
-        let mime = infer::get(&bytes)
-            .map(|t| t.mime_type().to_string())
-            .unwrap_or_else(|| "application/octet-stream".to_string());
-
-        if !ALLOWED_MIMES.contains(&mime.as_str()) {
-            return Err(CliError::Usage(format!("unsupported file type: {mime}")));
-        }
+        // 2. Detect MIME from magic bytes and admit it as the relay would
+        let (mime, kind, max) = classify_upload(&bytes)?;
 
         // 3. Size check
-        let max = if mime.starts_with("video/") {
-            MAX_VIDEO_BYTES
-        } else {
-            MAX_IMAGE_BYTES
-        };
         if bytes.len() as u64 > max {
             return Err(CliError::Usage(format!(
                 "file too large: {} bytes (max {})",
@@ -1243,7 +1340,7 @@ impl BuzzClient {
 
         // 5. PUT request to the BUD-02 /upload endpoint with a generous timeout.
         // Auth is signed per attempt — matches the per-attempt signing pattern in download_media.
-        let upload_timeout = if mime.starts_with("video/") {
+        let upload_timeout = if kind != UploadKind::Image {
             Duration::from_secs(600)
         } else {
             Duration::from_secs(120)
@@ -2227,6 +2324,66 @@ mod retry_policy_tests {
         );
     }
 
+    /// q-121: a Markdown file has no magic bytes. It must reach `/upload` as a generic file
+    /// (`application/octet-stream`) and come back labelled with its filename, where the old
+    /// CLI refused it as "unsupported file type" without sending anything.
+    #[tokio::test]
+    async fn markdown_file_uploads_as_generic_file_with_filename() {
+        use std::io::Write;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"# Notes\n\nplain text\n")
+            .unwrap();
+
+        let content_types: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = content_types.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(200), stream.read(&mut buf))
+                    .await;
+            let req = String::from_utf8_lossy(&buf).to_string();
+            let ct = req
+                .lines()
+                .find(|l| l.to_lowercase().starts_with("content-type:"))
+                .map(|l| l[13..].trim().to_string())
+                .unwrap_or_default();
+            seen.lock()
+                .unwrap()
+                .push(format!("{} {ct}", req.lines().next().unwrap_or("")));
+            let ok_body = r#"{"url":"https://relay.test/media/abcd.bin","sha256":"abcd","size":21,"type":"application/octet-stream","uploaded":0}"#;
+            let ok = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                ok_body.len(),
+                ok_body
+            );
+            let _ = stream.write_all(ok.as_bytes()).await;
+        });
+
+        let client = test_client(&format!("http://{addr}"));
+        let desc = client
+            .upload_file(path.to_str().unwrap())
+            .await
+            .expect("markdown upload must be admitted");
+        assert_eq!(desc.filename.as_deref(), Some("notes.md"));
+        assert_eq!(desc.mime_type, "application/octet-stream");
+        let seen = content_types.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one upload request");
+        assert!(seen[0].starts_with("PUT /upload "), "{}", seen[0]);
+        assert!(seen[0].ends_with("application/octet-stream"), "{}", seen[0]);
+    }
+
     /// `upload_file` uses `with_retry_body` — the full operation including response
     /// body read is inside the retry boundary.  A partial-body drop after 200 headers
     /// must be retried with identical file bytes and a fresh Blossom auth per attempt.
@@ -2408,6 +2565,135 @@ mod retry_policy_tests {
             3,
             "all 3 attempts must fire before surfacing DeliveryUnknown"
         );
+    }
+}
+
+#[cfg(test)]
+mod upload_kind_tests {
+    use super::{build_imeta_tag, classify_upload, upload_filename, BlobDescriptor, UploadKind};
+
+    #[test]
+    fn markdown_and_plain_text_are_generic_files() {
+        // q-121: no-magic text used to be refused as octet-stream before any HTTP request.
+        for body in [
+            &b"# Notes\n\n- one\n"[..],
+            b"plain text\n",
+            b"a,b\n1,2\n",
+            b"{\"k\":1}",
+        ] {
+            let (mime, kind, max) = classify_upload(body).unwrap();
+            assert_eq!(mime, "application/octet-stream");
+            assert_eq!(kind, UploadKind::File);
+            assert_eq!(max, 100 * 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn sniffed_documents_are_generic_files() {
+        let (mime, kind, _) = classify_upload(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n").unwrap();
+        assert_eq!(mime, "application/pdf");
+        assert_eq!(kind, UploadKind::File);
+    }
+
+    #[test]
+    fn media_keeps_its_own_path_and_caps() {
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+        ];
+        assert_eq!(classify_upload(&jpeg).unwrap().1, UploadKind::Image);
+        let mp4 = [
+            0, 0, 0, 0x18, b'f', b't', b'y', b'p', b'm', b'p', b'4', b'2', 0, 0, 0, 0,
+        ];
+        assert_eq!(classify_upload(&mp4).unwrap().1, UploadKind::Video);
+    }
+
+    #[test]
+    fn relay_refused_types_fail_before_upload() {
+        // ELF executable (infer needs a full 64-byte header), audio, and an image format the
+        // relay has no validator for.
+        let mut elf = b"\x7fELF\x02\x01\x01".to_vec();
+        elf.resize(64, 0);
+        let mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec();
+        let bmp = b"BM\x3a\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00".to_vec();
+        for (name, body) in [("elf", elf), ("mp3", mp3), ("bmp", bmp)] {
+            match classify_upload(&body) {
+                Err(e) => assert!(
+                    e.to_string().contains("unsupported file type"),
+                    "{name}: {e}"
+                ),
+                Ok(v) => panic!("{name} must be refused, got {v:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn filename_is_last_component_and_bounded() {
+        assert_eq!(upload_filename("/tmp/dir/notes.md"), "notes.md");
+        assert_eq!(upload_filename(r"C:\docs\report.txt"), "report.txt");
+        assert_eq!(upload_filename("a\nb.txt"), "ab.txt");
+        assert_eq!(upload_filename("dir/"), "file");
+        assert_eq!(upload_filename(&"x".repeat(400)).chars().count(), 255);
+    }
+
+    #[test]
+    fn multibyte_filename_fits_the_relay_byte_bound_through_imeta() {
+        // Murphy, PR 19: 200 × 'é' is 200 chars but 400 bytes; the relay refuses imeta
+        // `filename` over 255 bytes, so a char cap let upload pass and `messages send` fail.
+        for name in [
+            "é".repeat(200),
+            "日本語".repeat(100),
+            format!("{}🙂.md", "a".repeat(253)),
+        ] {
+            let fname = upload_filename(&format!("/tmp/{name}"));
+            assert!(fname.len() <= 255, "{} bytes", fname.len());
+            assert!(
+                name.starts_with(&fname),
+                "cut must keep a prefix at a char boundary"
+            );
+            let d = BlobDescriptor {
+                filename: Some(fname),
+                ..serde_json::from_str(
+                    r#"{"url":"https://r.test/media/ab.bin","sha256":"ab","size":3,"type":"application/octet-stream","uploaded":0}"#,
+                )
+                .unwrap()
+            };
+            let tag = build_imeta_tag(&d);
+            let value = tag
+                .iter()
+                .find_map(|f| f.strip_prefix("filename "))
+                .unwrap();
+            assert!(
+                !value.is_empty() && value.len() <= 255,
+                "imeta filename {} bytes",
+                value.len()
+            );
+        }
+        assert_eq!(upload_filename(&"é".repeat(200)).len(), 254);
+    }
+
+    #[test]
+    fn unknown_iso_bmff_brand_is_refused_like_the_relay() {
+        let mut body = vec![0, 0, 0, 0x18];
+        body.extend_from_slice(b"ftypzzzz\0\0\0\0zzzz");
+        let err = classify_upload(&body).unwrap_err().to_string();
+        assert!(err.contains("unsupported file type"), "{err}");
+    }
+
+    #[test]
+    fn imeta_carries_filename() {
+        let d: BlobDescriptor = serde_json::from_str(
+            r#"{"url":"https://r.test/media/ab.bin","sha256":"ab","size":3,"type":"application/octet-stream","uploaded":0}"#,
+        )
+        .unwrap();
+        assert!(d.filename.is_none(), "relay responses carry no filename");
+        assert!(!build_imeta_tag(&d)
+            .iter()
+            .any(|f| f.starts_with("filename ")));
+        let d = BlobDescriptor {
+            filename: Some("notes.md".into()),
+            ..d
+        };
+        assert_eq!(build_imeta_tag(&d).last().unwrap(), "filename notes.md");
     }
 }
 
